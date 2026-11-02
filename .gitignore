@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时产物
+run/
+data/
+dist/
+build/
+*.log
+.env
+
+# Android / Gradle
+.gradle/
+local.properties
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp
