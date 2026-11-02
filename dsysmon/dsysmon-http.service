@@ -1,0 +1,50 @@
+# dsysmon-http.service —— 让手机 App 随时连得上
+#
+# 【默认不启用】这是"要让服务常驻"时才用的单元。不启用也能用：
+# 需要时手动跑 `dsysmon-serve`（前台，Ctrl-C 停止）。
+#
+# 启用方式（不需要 sudo，属于用户级服务）：
+#   mkdir -p ~/.config/systemd/user
+#   cp dsysmon-http.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dsysmon-http
+#   systemctl --user status dsysmon-http
+#
+# 注意：用户级服务默认只在"该用户有登录会话"时运行。若希望未登录时也常驻，
+# 需要 `sudo loginctl enable-linger $USER` —— 那是一条需要 root 的系统设置变更，
+# 默认不做。
+
+[Unit]
+Description=dsysmon HTTP 监测端点（供手机 App 经 IPv6 拉取）
+Documentation=file:%h/dsh/dsysmon/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 无缓冲：否则启动那几行（含盘面 URL 与 token 提示）在日志里看不到
+Environment=PYTHONUNBUFFERED=1
+# 只读监测端点：绑定所有 IPv6，IPv4 由应用层拒绝（回环除外）
+# --dashboard-file：定时把盘面写成文件。手机在运营商网段时够不到本机的
+# 校园网 IPv6 地址，这条文件路径让它能经**已授权的 SFTP** 读到同样的盘面
+# （与传输助手下文件同一条链路），不需要端口转发授权。
+ExecStart=%h/.local/bin/dsysmon --serve --port 8899 \
+    --dashboard-file %h/.local/state/server-monitor/dashboard.html \
+    --dashboard-file-interval 20
+Restart=on-failure
+RestartSec=5
+# 日志走 journal，token 已被服务端脱敏后再写日志
+StandardOutput=journal
+StandardError=journal
+
+# 【刻意不启用 --pair】配对端点 /api/pair 是**唯一一个不需要认证就能换到令牌**的
+# 入口，虽然配对码有 40 bit 且一次性，但它可以被无限次尝试、撞中一次就拿到永久令牌
+# （令牌在配对后不轮换），而且服务端没有失败锁定、配对码也不脱敏。
+# 关掉之后攻击面回到"必须知道 32 字符令牌"。
+# 代价：手工把 `cat ~/.local/state/server-monitor/token` 的内容粘进 App 的「访问令牌」一次。
+# 需要临时配对时，单独跑一次：
+#     dsysmon --serve --port 8899 --pair        # 前台起一个带配对码的实例
+# 或临时把 --pair 加回本行并 `systemctl --user restart dsysmon-http`（重启会换新码）。
+
+[Install]
+WantedBy=default.target
