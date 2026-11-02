@@ -1,0 +1,3 @@
+# MiniCheck 打分器
+torch>=2.0
+transformers>=4.40
