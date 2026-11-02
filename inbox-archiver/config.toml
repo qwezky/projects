@@ -1,0 +1,149 @@
+# inbox-archiver 配置
+#
+# 优先级：环境变量（ARCHIVE_ROOT / INBOX_DIR / RECORDS_DIR / TODOS_DIR /
+#         INBOX_STATE_DIR / INBOX_OCR_MODE / INBOX_AUTOSTART / INBOX_LLM_STATE /
+#         INBOX_CONFIG）> 本文件 > 程序内置默认值
+# 改完直接生效，不用重启任何东西（本工作流没有常驻进程）。
+
+[paths]
+# 归档库根目录
+root = "~/phone-archive"
+# 原文件：手机「存档区」入口上传到这里（收件箱，本程序只处理它）
+raw = "~/phone-archive/raw"
+# 档案：文本直接放进来；图片按 <名字>/ 打包（原图 + text.md）
+records = "~/phone-archive/records"
+# 事项：todos/年.月.日/ 每天一个 todos.md + todos.jsonl
+todos = "~/phone-archive/todos"
+# 运行状态：sqlite、日志、锁
+state_dir = "~/.local/state/inbox-archiver"
+
+[filters]
+# 明显是测试/临时残留的，原样留在 raw/ 不整理
+ignore_globs = ["e2e*.bin", "*.part", "*.tmp", "*.crdownload", "*.filepart", ".*"]
+# 修改时间距今超过这么多秒，才认为「手机那头传完了」
+min_stable_seconds = 30
+min_size = 1
+recursive = false
+
+[models]
+llm_host = "127.0.0.1"
+llm_port = 8080            # llm serve 的 Qwen3-4B（抽待办）
+llm_alias = "qwen3-4b"
+llm_timeout = 900
+llm_max_tokens = 900
+llm_temperature = 0.0
+max_text_chars = 8000      # 抽待办时喂进去的材料正文上限
+max_ocr_chars = 8000
+
+# ── 远程免费模型（默认启用；清空 llm_remote_chain 即退回本地 Qwen3-4B）──
+# 走 DSH 里已配好的路由，密钥从 ~/.dsh/.credentials.yaml 的 refs 只读读取。
+#
+# ⚠️ 2026-10-18 实测更正：ModelScope 那 14 个**不是零成本** ——
+#    deepseek-ai/DeepSeek-V4-Pro 每次扣 2 魔粒、Qwen/Qwen3.8-Flash-Next 扣 1 魔粒
+#    （实测余额 119→117），一个 119 篇的批量就吃掉 89 魔粒。
+#    真正标价 ¥0 的只有 ZAI 与 SiliconFlow。所以默认链把它们排前面。
+#
+# 速度/质量取舍（同一份通知实测）：
+#   ZAI glm-4.5-flash    ¥0    24–38s  较弱
+#   SiliconFlow Qwen3-8B ¥0    10–22s  较弱
+#   ModelScope V4-Pro    2 魔粒  3–10s  最好（日期提取最准）
+# 想要质量优先：把 modelscope 那条挪到链首即可。
+llm_remote_chain = [
+  "modelscope:deepseek-ai/DeepSeek-V4-Pro",
+  "modelscope:Qwen/Qwen3.8-Flash-Next",
+  "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free",
+  "siliconflow:Qwen/Qwen2.5-7B-Instruct",
+  "siliconflow:THUDM/GLM-4-9B-0414",
+  "siliconflow:THUDM/GLM-Z1-9B-0414",
+  "zai:glm-4.5-flash",
+]
+llm_min_interval = 1.0     # 免费档按账号限速：串行 + 至少 1 秒间隔
+llm_remote_timeout = 120   # 远程单次超时（本地那份 900 是给 CPU 推理留的）
+# 带思考链的模型（ZAI 等）实测先写 1100~1900 字 reasoning，预算给 900 会
+# 导致 content 返回空字符串。远程一律给 2000。
+llm_remote_max_tokens = 2000
+
+ocr_host = "127.0.0.1"
+ocr_port = 8083            # PaddleOCR-VL-1.6
+ocr_prompt = "OCR:"
+ocr_timeout = 1800
+# always = 存档区的图片一律 OCR（默认）；auto = 只挑截图/文档类；off = 不 OCR
+ocr_mode = "always"
+ocr_skip_camera = true     # 仅 auto 模式生效
+
+autostart = true           # 模型服务没在跑就自动拉起
+llm_state_dir = ""         # 留空 = 用 `llm` 脚本自己的默认目录 ~/.local/state/llm
+ocr_start_script = ""      # 留空 = 不自动拉起；填你自己的 OCR 启动脚本路径
+start_timeout = 300
+
+[todos]
+require_date = true        # 没写日期的不入 todos（内容仍在 records/ 里）
+max_span_days = 120        # 跨多日事项最多铺开多少天
+past_grace_days = 365      # 早于今天这么多天的日期当幻觉丢掉
+future_limit_days = 1825   # 晚于今天这么多天的日期当幻觉丢掉
+
+# ── 准确率优先：多路抽取 + 一致度聚类 + 材料在手复核（「不惜一切时间代价」）──
+# 一份材料会被问模型 1 + passes-1 + alt_prompt + verify 次；
+# 想快就 `inbox run --fast`（只问一次），或把 passes 调 1、verify 关掉。
+# 路数 3 → 5：实测初版 Qwen3-4B 在「一行一场」的清单材料上，个别路会漏抽或吐不出 JSON
+# （同一份讲座清单出现过 7 条 / 3 条并存）。多跑几路让「票数多的说法」更可靠，
+# 代价只有时间：每份材料 6 次调用（5 路主提示词 + 1 路换切分）。
+passes = 5                 # 本地 Qwen3-4B 用的路数：第 1 路温度 0 求稳，其余采样求广
+# 远程大模型用的路数（2026-10-18 用户要求「用大模型就不用投那么多票」）。
+# sample_temperature=0 时第 2..N 路是重复调用，只为给弱模型兜住输出不稳；
+# V4-Pro 一致性本就高，1 主 + 1 换切分（alt_prompt）就够。实测同一份材料仍是 7/7 条。
+passes_remote = 1
+# 采样路温度。实测（Qwen3-4B-Q4_K_M，五份真实材料、每份多轮）：
+#   0.5 → 采样路跑偏：「一行一场」的活动清单被写成几条空泛的「参加某日的讲座」
+#         （丢场次、把两场并成一场），还多出「报名」/「参加」两条同名待办；
+#   0.2 → 大体可用，但仍会偶发「参加某日××专场讲座」这种拿栏目标题当活动名的
+#         弱标题（同一份材料换一次跑就变样）；
+#   0.0 → 各路口径一致：该抽 7 条的抽满 7 条、该 4 条的 4 条、报名+活动 2 条、单场 1 条；
+#         「换切分」那路在 0 上也给出具体活动名，不再吐弱标题。
+# 4B 量化模型扛不住采样，别往上调。多路的意义在于「换切分」那条不同提示词的路 + 兜住
+# GPU 偶发的输出抖动（同一温度 0 的请求也会因浮点不确定性偶尔换一种说法）。
+sample_temperature = 0.0
+alt_prompt = true          # 再加一路「先抄时间点→谓语，再转待办」的换切分
+# 复核（让模型当裁判）。实测它会丢条目、把事项缩写成两个字，所以默认关。
+# 4B 模型当裁判比当选手更差 —— 细节见 archiver/config.py 的注释。
+verify = false
+merge_threshold = 0.6      # 合并门槛（簇内任一成员够像就并）；分歧记在 variants 里
+
+[behavior]
+# raw 里出现「既不是文本也不是图片」时：error（留在原处并报错）/ move（原样搬进 records）/ ignore
+# 正常不会出现——App 的存档区入口会先拦下来并在手机上报错。
+foreign_action = "error"
+# 模型服务拉不起来时：defer（原样留在 raw 等下次）/ skip（照样归档但抽不出待办）
+on_model_error = "defer"
+# 手机触发后先等这么久再扫，避开还没写完的文件
+trigger_delay_seconds = 35
+# 内容重复的上传去向
+duplicate_dir = "_duplicate"
+name_max = 80              # 文本进 records 时文件名最长字符数
+bundle_name_max = 60       # 图片打包目录名最长字符数
+
+# ── 热启动：重负载前先用低强度负载把 EC 的风扇带起来 ──────────────────
+# ✅ 2026-10-15 直读 EC 转速测出来：**有效，默认打开**（详见 archiver/preheat.py）。
+#
+# 本机风扇完全由 EC 按自己的曲线控制（没有 pwm；ideapad 的 fan_mode 是空壳：
+# 写 1、写 4 都不生效、读回恒 0）。转速可以从 EC RAM 直接读：
+#   FANS = 偏移 6，FA2S = 偏移 254，值 ×100 = rpm
+#   sudo <本仓库 thermal/fan-rpm.sh> watch 30
+#
+# 实测（同一张 2481×3507 的图，同一时刻的 OCR）：
+#   * 冷机直跑：峰值 63 °C、单秒最大温升 +7 °C —— 风扇要 ~42 秒才起转，之前一路裸奔；
+#   * 先预热再跑：峰值 51 °C、单秒 +2 °C —— 风扇起转后温度从 64 °C 掉回 51 °C；
+#   * **风扇从 0 到 1400 rpm 需要 24~42 秒的持续负载**，起转点约 53 °C。
+#
+# ⚠️ min_seconds 是这套东西能不能生效的关键：风扇起转要 20 多秒，而 CPU 一冲
+# turbo 就能在 1 秒内把包温读数顶到 61~63 °C —— 若允许"温度达标就停"，预热会在
+# 1.5 秒就退出、风扇根本没转（这正是 2026-10-15 早些时候那轮 A/B 误判"无收益"的原因）。
+[preheat]
+enabled = true             # 大图 OCR 前做热启动（`inbox run --no-preheat` 可单次关掉）
+min_seconds = 30.0         # 至少跑这么久才允许"温度达标"提前收工 —— 给风扇留起转时间
+target_temp_c = 64.0       # 跑够 min_seconds 后，到这个包温就停手
+max_seconds = 60.0         # 上限，避免冷环境下无限等
+threads = 4                # 实测 4 线程 nice 10 升温 ≈0.2~0.4 °C/s（43→62 约 45s）；
+                           # 2 线程 45 秒只抬 6 °C，到不了目标，等于白烧
+min_pixels = 1500000       # 只对够大的图预热：截图 147 万像素不预热，扫描页 870 万才预热
+poll_seconds = 0.5         # 采样间隔

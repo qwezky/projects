@@ -1,0 +1,50 @@
+# 端到端演练用配置：raw/records/todos 全在 run/e2e/ 下，绝不碰真实归档库。
+# 用法： python3 bin/inbox --config tests/e2e-config.toml run
+[paths]
+root = "~/.local/state/inbox-archiver/e2e/archive"
+raw = "~/.local/state/inbox-archiver/e2e/archive/raw"
+records = "~/.local/state/inbox-archiver/e2e/archive/records"
+todos = "~/.local/state/inbox-archiver/e2e/archive/todos"
+state_dir = "~/.local/state/inbox-archiver/e2e/state"
+
+[filters]
+ignore_globs = ["e2e*.bin", ".*"]
+min_stable_seconds = 5
+min_size = 1
+recursive = false
+
+[models]
+llm_host = "127.0.0.1"
+llm_port = 8080
+llm_alias = "qwen3-4b"
+llm_timeout = 900
+llm_max_tokens = 900
+llm_temperature = 0.0
+max_text_chars = 8000
+max_ocr_chars = 8000
+
+ocr_host = "127.0.0.1"
+ocr_port = 8083
+ocr_prompt = "OCR:"
+ocr_timeout = 1800
+ocr_mode = "always"
+
+autostart = true
+# 让 `llm` 脚本的 pid/log 也落在工作区内，免得演练污染 ~/.local/state/llm
+llm_state_dir = "~/.local/state/inbox-archiver/e2e/llm-state"
+ocr_start_script = ""
+start_timeout = 300
+
+[todos]
+require_date = true
+max_span_days = 120
+past_grace_days = 365
+future_limit_days = 1825
+
+[behavior]
+foreign_action = "error"
+on_model_error = "defer"
+trigger_delay_seconds = 0
+duplicate_dir = "_duplicate"
+name_max = 80
+bundle_name_max = 60

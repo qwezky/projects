@@ -1,0 +1,47 @@
+#!/bin/sh
+# transfer-gateway —— 手机「传输助手」那条 SSH 公钥的**受限期 forced command**。
+#
+# 为什么需要它：手机上传完要"叫服务器开始归档"，但原来的授权行是
+#   command="internal-sftp -d %d/phone-upload"
+# 只能用 SFTP，没法执行命令。把它换成这个脚本后，这条密钥**只**能做两件事：
+#   1) 走 SFTP（原样保留，起始目录仍是 ~/phone-upload）—— 老的"选择文件上传"照旧
+#   2) 发一个固定字符串 `archive-trigger` —— 让服务器后台开始一轮归档
+# 其它任何命令一律拒绝，而且**我们从不 eval $SSH_ORIGINAL_COMMAND**，
+# 因此不存在命令注入：匹配到的只是字面量，执行的是写死的程序。
+#
+# 日志：~/.local/state 不放，统一写本工程的 run/gateway.log
+set -u
+
+PROJECT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+SFTP_SERVER=${SFTP_SERVER:-/usr/lib/openssh/sftp-server}
+SFTP_START=${PHONE_UPLOAD_DIR:-$HOME/phone-upload}
+INBOX=$PROJECT/bin/inbox
+GATEWAY_LOG=${GATEWAY_LOG:-$PROJECT/run/gateway.log}
+
+original="${SSH_ORIGINAL_COMMAND:-}"
+# 子系统请求时 sshd 给的 SSH_ORIGINAL_COMMAND 会带一个尾随空格（实测是
+# "/usr/lib/openssh/sftp-server "），所以匹配前先剪掉尾部空白。
+# 只是剪空白后比对字面量，从不 eval 这个字符串。
+trimmed=$(printf '%s' "$original" | sed 's/[[:space:]]*$//')
+
+_log() {
+    printf '%s peer=%s orig=[%s]\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${SSH_CONNECTION:-?}" "$original" \
+        >>"$GATEWAY_LOG" 2>/dev/null || true
+}
+
+case "$trimmed" in
+    sftp|internal-sftp|/usr/lib/openssh/sftp-server)
+        _log
+        exec "$SFTP_SERVER" -d "$SFTP_START"
+        ;;
+    archive-trigger)
+        _log
+        exec "$INBOX" trigger --peer "${SSH_CONNECTION:-unknown}"
+        ;;
+    *)
+        _log
+        echo "transfer-gateway: 这条密钥只允许 SFTP 与 archive-trigger" >&2
+        exit 1
+        ;;
+esac

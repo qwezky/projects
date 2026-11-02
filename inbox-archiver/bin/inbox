@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""inbox —— 手机上传 → 本地模型整理归档 的入口。
+
+直接跑本文件，或在 PATH 里做一个软链：
+    ln -sf "$(pwd)/bin/inbox" ~/.local/bin/inbox
+"""
+import sys
+from pathlib import Path
+
+PROJECT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT))
+
+from archiver.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())
