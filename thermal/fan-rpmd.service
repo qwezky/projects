@@ -1,0 +1,22 @@
+[Unit]
+Description=Expose EC fan RPM to /run/fan-rpm (read-only)
+Documentation=file:/usr/local/sbin/fan-rpmd.py
+After=multi-user.target
+
+[Service]
+Type=simple
+# 必须以 root 跑：EC RAM 的 debugfs 入口是 0400 root。
+# 脚本装在 /usr/local/sbin 且 root 拥有、其他用户不可写 —— 否则等于一条提权路径。
+ExecStart=/usr/bin/python3 /usr/local/sbin/fan-rpmd.py
+Restart=always
+RestartSec=3
+Nice=5
+# 只读 EC：不加载 write_support，写不了 EC。
+# 沙箱：只允许写 /run
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/run
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
