@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+  云备份规则（API 31 之前使用；31+ 用 data_extraction_rules.xml）。
+  由 AndroidManifest 的 android:fullBackupContent 引用。
+
+  关键：**SSH 私钥不能进云备份** —— 它等同于服务器上的文件读写权限。
+-->
+<full-backup-content>
+    <exclude domain="file" path="ssh/" />
+</full-backup-content>

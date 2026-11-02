@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  个人自用：允许明文 HTTP（家里的局域网服务器通常没证书）。
+  要上架或对公网使用，应改成只对特定域名/网段放行，或全面走 https。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

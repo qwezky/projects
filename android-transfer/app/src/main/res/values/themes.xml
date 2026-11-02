@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.TransferDemo" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- 启动瞬间的窗口底色跟品牌色对齐，避免白闪 -->
+        <item name="android:windowBackground">#F5FAFA</item>
+        <!-- 边到边：系统栏透明，由代码用 insets 给内容留出安全区 -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

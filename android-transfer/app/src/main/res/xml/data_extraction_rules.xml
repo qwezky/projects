@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+  API 31+ 的备份 / 设备迁移规则，由 AndroidManifest 的
+  android:dataExtractionRules 引用。
+
+  云备份与设备迁移都排除 SSH 私钥：换机时应该重新生成一把并在服务器上换掉那一行，
+  而不是把凭据拷来拷去。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="ssh/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="ssh/" />
+    </device-transfer>
+</data-extraction-rules>

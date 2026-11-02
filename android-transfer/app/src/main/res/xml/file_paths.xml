@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 与 TransferRepository 的落盘目录保持一致（filesDir/downloads） -->
+    <files-path name="downloads" path="downloads/" />
+    <!-- 文本上传：先把文本写成 cacheDir 里的文件，再经 FileProvider 交给上传逻辑 -->
+    <cache-path name="text-upload" path="text-upload/" />
+</paths>
