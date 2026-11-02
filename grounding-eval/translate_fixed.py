@@ -107,13 +107,13 @@ def main() -> int:
             claims_en[t] = g or t
 
     # ---- 验证：同一材料内，专名只有一个英文写法 ----
-    probes = ["新生杯", "院系杯", "福昕PDF", "帆软杯"]
+    probes = ["文化节", "联赛", "阅读器", "数据分析赛"]
     variants = {
-        "新生杯": ["New Student Cup", "Newcomer Cup", "New Generation Cup",
-                   "New Life Cup", "Shengxin Cup", "Freshman Cup"],
-        "院系杯": ["Institute Cup", "Department Cup", "School Cup", "Faculty Cup"],
-        "福昕PDF": ["Foxit PDF", "Fu Shen PDF", "Fuxin PDF", "Foxit"],
-        "帆软杯": ["Fane Soft Cup", "Fanrong Cup", "Fanruan Cup", "FineSoft Cup"],
+        "文化节": ["Culture Festival", "Cultural Festival", "Culture Fair"],
+        "联赛": ["League", "Tournament", "Championship"],
+        "阅读器": ["Reader", "PDF Reader", "Document Reader"],
+        "数据分析赛": ["Data Analysis Contest", "Data Analytics Competition",
+                   "Data Analysis Challenge"],
     }
     print("\n验证：每份材料内「文档 + 它的断言」的译名写法")
     bad = 0

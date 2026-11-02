@@ -37,7 +37,7 @@ python3 verify.py --items samples/items --out /tmp/verify.jsonl
 
 ```
 材料 notice-2026-11-05  （2 条待办）
-   ✓              参加新生交流赛（5米休闲组/10米竞赛组）
+   ✓              参加社团交流活动（上午场/下午场）
         p=0.96
    ⚠️ 疑似无依据   11月9日提交报名表到社团办公室
         p=0.12
@@ -55,7 +55,7 @@ python3 verify.py --items samples/items --out /tmp/verify.jsonl
 
 ```markdown
 ---
-task: 参加新生交流赛
+task: 参加社团交流活动
 start_date: 2026-11-08
 end_date: 2026-11-08
 record_path: samples/records/notice-2026-11-05.md
