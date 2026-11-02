@@ -1,0 +1,65 @@
+{
+  "_comment": "站点配置示例。把 base 与 columns[].path 换成你自己的站点；同一套 Webplus CMS 的栏目列表页通常形如 /xxx/list.htm。",
+  "crawl": {
+    "delay": 1.0,
+    "timeout": 20,
+    "retries": 3,
+    "max_pages": 2,
+    "limit_per_column": 40,
+    "respect_robots": true,
+    "user_agent": "NoticeRadar/1.0 (personal use; contact: you@example.com)",
+    "browser_ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  },
+  "llm": {
+    "_comment": "backend=local 走本机 OpenAI 兼容端点；backend=free 走下面的远程链（密钥从环境变量读）。",
+    "backend": "local",
+    "chain": [
+      ["siliconflow", "Qwen/Qwen2.5-7B-Instruct"],
+      ["zai", "glm-4.5-flash"]
+    ],
+    "min_interval": 1.0,
+    "max_tokens": 2000,
+    "local": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "model": "qwen3-4b",
+      "timeout": 300
+    }
+  },
+  "ocr": {
+    "enabled": true,
+    "backend": "local",
+    "max_pages": 3,
+    "dpi": 200,
+    "order": ["local"],
+    "local": {
+      "host": "127.0.0.1",
+      "port": 8083,
+      "timeout": 600,
+      "prompt": "OCR:"
+    },
+    "vision": {
+      "chain": [],
+      "max_tokens": 3000,
+      "timeout": 180
+    }
+  },
+  "sites": [
+    {
+      "id": "example-notices",
+      "name": "示例通知公告",
+      "base": "https://www.example.edu",
+      "columns": [
+        {"name": "通知公告", "path": "/tzgg/list.htm"},
+        {"name": "新闻动态", "path": "/xwdt/list.htm"}
+      ]
+    },
+    {
+      "id": "example-dept",
+      "name": "示例院系",
+      "base": "https://dept.example.edu",
+      "columns": [
+        {"name": "学术活动", "path": "/xsdt/list.htm"}
+      ]
+    }
+  ]
+}
