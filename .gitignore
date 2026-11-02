@@ -4,16 +4,24 @@ __pycache__/
 .venv/
 venv/
 
-# 运行时产物
-run/
-data/
-dist/
-build/
+# 运行时产物（按项目根限定：不要用裸 data/、build/，
+# 否则会误伤 Android 源码里名为 data 的包）
+/inbox-archiver/run/
+/notice-radar/data/
+/notice-radar/reports/
+/dsh-client/build/
+/dsh-client/dist/
+/android-transfer/build/
+/android-transfer/app/build/
+/android-transfer/.gradle/
+/android-transfer/.kotlin/
 *.log
 .env
 
+# MiniCheck 权重
+ckpt/
+
 # Android / Gradle
-.gradle/
 local.properties
 *.apk
 *.aab
@@ -26,6 +34,3 @@ captures/
 .vscode/
 .DS_Store
 *.swp
-
-# MiniCheck 权重
-ckpt/
