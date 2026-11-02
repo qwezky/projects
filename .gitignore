@@ -26,3 +26,6 @@ captures/
 .vscode/
 .DS_Store
 *.swp
+
+# MiniCheck 权重
+ckpt/
