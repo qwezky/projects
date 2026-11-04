@@ -2450,7 +2450,7 @@ def serve(args):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt, *a):
-            # 默认日志会把 token 写进访问日志，这里显式脱敏
+            # 默认日志会把 token 写进访问日志，这里显式打码
             line = fmt % a
             line = re.sub(r"token=[A-Za-z0-9_\-]+", "token=***", line)
             # 刻意**不自己打时间戳**：交给 journald。

@@ -33,13 +33,13 @@ ExecStart=%h/.local/bin/dsysmon --serve --port 8899 \
     --dashboard-file-interval 20
 Restart=on-failure
 RestartSec=5
-# 日志走 journal，token 已被服务端脱敏后再写日志
+# 日志走 journal，token 已在写日志前打码
 StandardOutput=journal
 StandardError=journal
 
 # 【刻意不启用 --pair】配对端点 /api/pair 是**唯一一个不需要认证就能换到令牌**的
 # 入口，虽然配对码有 40 bit 且一次性，但它可以被无限次尝试、撞中一次就拿到永久令牌
-# （令牌在配对后不轮换），而且服务端没有失败锁定、配对码也不脱敏。
+# （令牌在配对后不轮换），而且服务端没有失败锁定、配对码也不打码。
 # 关掉之后攻击面回到"必须知道 32 字符令牌"。
 # 代价：手工把 `cat ~/.local/state/server-monitor/token` 的内容粘进 App 的「访问令牌」一次。
 # 需要临时配对时，单独跑一次：
