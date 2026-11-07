@@ -42,11 +42,11 @@ public final class DshClient {
      * 迟早会过期 —— 这个常量只保证"隧道也问不到时还能试一把"。
      */
     static final String DEFAULT_HOST = "127.0.0.1";
-    /** 兜底 token 留空：默认走 `--token auto`（经隧道从服务器日志取）。 */
+    /** 同上：dsh web 启动时打印的那串进程级 token，重启 dsh web 就会变，这里只是兜底。 */
     static final String DEFAULT_TOKEN = "";
     /** 网页隧道（web 模式）的地址 */
     /** 版本号 —— **由 build-jar.sh 按参数自动写入**（别手改，改了就两边不一致）。 */
-    static final String VERSION = "1.0.0";
+    static final String VERSION = "3.0.9";
 
     static final String DEFAULT_WEB_URL = "https://dsh.example.com/";
     /**
@@ -69,8 +69,8 @@ public final class DshClient {
      * 历史版本内置过的默认值。老安装的 `~/.dsh-client.properties` 里存的是它们的字面量，
      * 那是"写死的旧值"而不是用户的选择 —— 载入时迁移成 `auto`，否则升级后依旧会连旧地址。
      */
-    static final String LEGACY_HOST = "";
-    static final String LEGACY_TOKEN = "";
+    static final String LEGACY_HOST = "2001:db8::2:5e87:9cff:fee3:6836";
+    static final String LEGACY_TOKEN = "xEsipm3f0RrCqgofUDjcFe7vuttpkbHx2hCloyVOcrQ";
     /** SSH over WebSocket 的地址（tunnel 模式） */
     static final String DEFAULT_TUNNEL_HOST = "ssh.example.com";
     static final String DEFAULT_TUNNEL_WS = "wss://ssh.example.com/";
@@ -85,7 +85,7 @@ public final class DshClient {
         /** 设置值：`auto`（默认，经隧道发现）或 IPv6/域名（用户指定就不去发现）。 */
         String host = AUTO;
         int port = 22;
-        String user = "user";
+        String user = "tudi";
         String key = detectKeyPath();
         /** 本机监听端口（浏览器访问的那个） */
         int localPort = 3080;
@@ -103,6 +103,14 @@ public final class DshClient {
         int simulateDropSeconds = 0;
         /** `--no-discover`：跳过"经隧道发现"，直接用上面两个设置的原值/内置兜底。 */
         boolean discover = true;
+        /** 主题：system（跟随系统）/ dark / light（2.10.0，界面右上角切换，存进 properties）。 */
+        String theme = "system";
+        /** 合并窗口：DSH 与 WorkBuddy 放进同一个浏览器窗口的标签页（2.12.0）。 */
+        boolean mergeWindows = true;
+        /** 内嵌浏览器：用 JCEF 把网页画进客户端页签（2.13.0；需要 cef 目录里的两个 jar）。 */
+        boolean embeddedBrowser = true;
+        /** 反向迁移标记：2.17.4 那版把 embeddedBrowser 写成了 false，这里强制纠回一次。 */
+        boolean embeddedForcedOn = false;
 
         // ---------------- WorkBuddy 桌面（1.4.0） ----------------
         /** 是否启用 WorkBuddy 桌面窗口（界面上那个按钮）。 */
@@ -168,6 +176,13 @@ public final class DshClient {
     }
 
     public static void main(String[] args) throws Exception {
+        Startup.install();
+        Startup.startEdtWatchdog();
+        // 顶层兜底：任何启动期异常都要"看得见"，别让窗口一闪就没了
+        Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
+            Startup.error("未捕获异常（" + th.getName() + "）", ex);
+            ex.printStackTrace();
+        });
         Map<String, String> opt = parse(args);
         if (opt.containsKey("version")) {
             System.out.println("DSH 客户端（电脑版）" + VERSION);
@@ -179,6 +194,8 @@ public final class DshClient {
             return;
         }
         Config cfg = loadConfig();
+        Startup.mark("配置已读，route=" + cfg.route + " theme=" + cfg.theme
+                + " embedded=" + cfg.embeddedBrowser + " merge=" + cfg.mergeWindows);
         if (opt.containsKey("host")) cfg.host = opt.get("host");
         if (opt.containsKey("port")) cfg.port = parseInt(opt.get("port"), cfg.port);
         if (opt.containsKey("user")) cfg.user = opt.get("user");
@@ -214,6 +231,8 @@ public final class DshClient {
         // 先把"每次重启都可能变的两个值"（当前 IPv6 / 当前 token）解析成具体值：
         // 默认设置是 auto，经隧道问服务器（见 RemoteInfo）；用户显式填了就尊重用户。
         resolveEndpoints(cfg);
+        Startup.mark("端点解析：host=" + cfg.hostResolved + " port=" + cfg.port
+                + (cfg.resolveNote.isEmpty() ? "" : "（" + cfg.resolveNote.replace('\n', ' ') + "）"));
         if (!cfg.resolveNote.isEmpty()) {
             System.out.println(cfg.resolveNote);
             System.out.flush();
@@ -343,10 +362,28 @@ public final class DshClient {
 
         final Config c = cfg;
         final RouteProbe.Route r = route;
+        Startup.mark("准备建窗口，route=" + r);
         SwingUtilities.invokeLater(() -> {
-            ClientFrame f = new ClientFrame(c, r);
-            f.setVisible(true);
-            f.startAndOpen();
+            try {
+                ClientFrame f = new ClientFrame(c, r);
+                Startup.mark("窗口对象已建好，setVisible…");
+                f.setVisible(true);
+                Startup.mark("窗口已显示，进入连接流程");
+                f.startAndOpen();
+            } catch (Throwable t) {
+                // 界面起不来时**必须留下证据**：写日志 + 弹一个能看见的框 + 非 0 退出
+                Startup.error("建窗口失败", t);
+                t.printStackTrace();
+                try {
+                    javax.swing.JOptionPane.showMessageDialog(null,
+                            "客户端启动失败：" + t + "\n\n详细堆栈已写入：\n"
+                                    + System.getProperty("user.home") + "\\.dsh-client-startup.log",
+                            "DSH 客户端", javax.swing.JOptionPane.ERROR_MESSAGE);
+                } catch (Throwable ignore) {
+                    // 连弹框都失败就只留日志
+                }
+                System.exit(3);
+            }
         });
     }
 
@@ -1531,7 +1568,6 @@ public final class DshClient {
     static String migrateRaw(String stored, String legacy, String fallback) {
         if (stored == null || stored.trim().isEmpty()) return fallback;
         String v = stored.trim();
-        if (legacy == null || legacy.isEmpty()) return v;
         return v.equals(legacy) ? fallback : v;
     }
 
@@ -1542,6 +1578,16 @@ public final class DshClient {
             p.load(in);
         } catch (Exception e) {
             return c; // 首次运行：没有配置文件
+        }
+        c.theme = p.getProperty("theme", c.theme);
+        c.mergeWindows = Boolean.parseBoolean(p.getProperty("mergeWindows", String.valueOf(c.mergeWindows)));
+        c.embeddedBrowser = Boolean.parseBoolean(p.getProperty("embeddedBrowser", String.valueOf(c.embeddedBrowser)));
+        c.embeddedForcedOn = Boolean.parseBoolean(p.getProperty("embeddedForcedOn", "false"));
+        if (!c.embeddedForcedOn) {
+            // 2.17.4 把默认改成 false 时，客户端会自动保存设置 → 老配置里被写进了 false。
+            // 不纠回来的话，之后所有版本都会把 DSH 甩到独立浏览器窗口（实机就是这么复现的）。
+            c.embeddedBrowser = true;
+            c.embeddedForcedOn = true;
         }
         c.host = migrateRaw(p.getProperty("host"), LEGACY_HOST, c.host);
         c.port = parseInt(p.getProperty("port"), c.port);
@@ -1678,7 +1724,7 @@ public final class DshClient {
 
                 其它：
                   --port <SSH 端口>      默认 22
-                  --user <用户名>        默认 user
+                  --user <用户名>        默认 tudi
                   --key <私钥路径>       默认 %s
                   --local-port <端口>    本机监听端口，默认 3080（填 0 = 只建 WB 那条转发，排错用）
 

@@ -8,22 +8,13 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# 优先用 JAVA_HOME，其次用 PATH 里的 javac（需要 JDK 17+）
-if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/javac" ]; then
-  JAVAC="$JAVA_HOME/bin/javac"; JAR="$JAVA_HOME/bin/jar"
-else
-  JAVAC="$(command -v javac || true)"; JAR="$(command -v jar || true)"
-fi
-[ -x "$JAVAC" ] || { echo "✗ 找不到 javac（装 JDK 17+ 或设 JAVA_HOME）" >&2; exit 1; }
-[ -x "$JAR" ]   || { echo "✗ 找不到 jar（装 JDK 17+ 或设 JAVA_HOME）" >&2; exit 1; }
+JAVA_HOME="${JAVA_HOME:-$HOME/android-dev/jdk17}"
+JAVAC="$JAVA_HOME/bin/javac"
+JAR="$JAVA_HOME/bin/jar"
+[ -x "$JAVAC" ] || { echo "✗ 找不到 javac：$JAVAC" >&2; exit 1; }
 
-# JSch：先在 Gradle / Maven 缓存里找，也可以用 JSCH_JAR 显式指定
-if [ -n "${JSCH_JAR:-}" ]; then
-  JSCH="$JSCH_JAR"
-else
-  JSCH="$(find "$HOME/.gradle" "$HOME/.m2" -name 'jsch-*.jar' 2>/dev/null | head -1)" || true
-fi
-[ -f "${JSCH:-}" ] || { echo "✗ 找不到 jsch jar；用 JSCH_JAR=/path/to/jsch.jar 指定" >&2; exit 1; }
+JSCH="$(ls "$HOME"/.gradle/caches/modules-2/files-2.1/com.github.mwiede/jsch/*/*/jsch-*.jar 2>/dev/null | head -1)"
+[ -f "$JSCH" ] || { echo "✗ 找不到 jsch jar" >&2; exit 1; }
 
 VER="${1:-1.0.0}"
 # 版本号写进源码常量：界面标题、启动日志、--help/--version 都从它取，避免"文件名是新的、跑的是旧的"
@@ -32,10 +23,26 @@ if grep -q 'static final String VERSION' "$SRC_MAIN"; then
   sed -i "s/static final String VERSION = \"[^\"]*\"/static final String VERSION = \"${VER}\"/" "$SRC_MAIN"
   echo "==> 版本号注入源码常量：$(grep -o 'static final String VERSION = "[^"]*"' "$SRC_MAIN" | head -1)"
 fi
-echo "==> 编译（目标 Java 17）"
+# 可选：cef/ 目录里放了 jcef-api.jar / jcefmaven.jar 时，把它们加进**编译**类路径
+# （不打进 fat jar —— 运行时由 run-cef.bat 用 -cp 提供，没它们也能正常启动）
+# cef/*.jar 不入库（第三方二进制）：需要时按下面的坐标自行下载，放进 cef/ 再构建
+#   org.jcef:jcef-api:132.3.1   +   me.friwi:jcefmaven:132.3.1
+#   以及传递依赖 gson / commons-compress / commons-codec / commons-io / commons-lang3
+EXTRA_CP=""
+for j in cef/*.jar; do
+  [ -f "$j" ] && EXTRA_CP="$EXTRA_CP:$j"
+done
+if [ -z "$EXTRA_CP" ]; then
+  echo "✗ cef/ 里没有 jar：内嵌浏览器相关类无法编译。" >&2
+  echo "  下载 jcef-api-132.3.1.jar 与 jcefmaven-132.3.1.jar（及 gson / commons-*）放进 cef/ 后重试。" >&2
+  echo "  只想编译无内嵌版：先删掉 JcefView.java / JcefGate.java 并移除 ClientFrame 里的相关引用。" >&2
+  exit 3
+fi
+done
+echo "==> 编译（目标 Java 17）${EXTRA_CP:+（含 cef 依赖）}"
 rm -rf build dist
 mkdir -p build/classes build/stage dist
-"$JAVAC" --release 17 -encoding UTF-8 -cp "$JSCH" -d build/classes $(find src -name '*.java')
+"$JAVAC" --release 17 -encoding UTF-8 -cp "$JSCH$EXTRA_CP" -d build/classes $(find src -name '*.java')
 
 echo "==> 组装 fat jar"
 cd build/stage

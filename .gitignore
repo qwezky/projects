@@ -34,3 +34,6 @@ captures/
 .vscode/
 .DS_Store
 *.swp
+/dsh-client/dist/
+/dsh-client/cef/*.jar
+/dsh-client/build/
