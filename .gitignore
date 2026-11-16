@@ -15,6 +15,10 @@ venv/
 /android-transfer/app/build/
 /android-transfer/.gradle/
 /android-transfer/.kotlin/
+/android-journal/build/
+/android-journal/app/build/
+/android-journal/.gradle/
+/android-journal/.kotlin/
 *.log
 .env
 

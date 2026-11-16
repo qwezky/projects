@@ -11,12 +11,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import dev.example.transfer.data.DirCache
 import dev.example.transfer.data.PublicDownloads
 import dev.example.transfer.data.SshConfig
 import dev.example.transfer.data.SshUploadRepository
 import dev.example.transfer.data.TransferRepository
+import dev.example.transfer.data.TransferRoute
 import dev.example.transfer.data.UploadOutcome
+import dev.example.transfer.net.DirList
+import dev.example.transfer.net.HttpTransferClient
 import dev.example.transfer.net.HttpFileServer
+import dev.example.transfer.net.RemoteEntry
 import dev.example.transfer.net.SshErrors
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -121,15 +126,18 @@ class MainScreenViewModel(context: Context) : ViewModel() {
     /** 测试连接：直连优先，失败退回隧道；成功后顺便列一下远端目录。 */
     fun testSshConnection() {
         if (_upload.value.running) return
-        _sshStatus.value = "连接中…（自动：WiFi/有线直连、移动数据走隧道；传的过程中太慢也会换路）"
+        _sshStatus.value = "连接中…（自动：有 IPv6 走直连，没有就走 HTTP 通道；传的过程中太慢也会换路）"
         viewModelScope.launch {
             try {
                 val conn = sshRepository.ensureConnection(_sshConfig.value, force = true)
                 if (conn.viaDirect) updateSshConfig { it.copy(lastGoodDirectHost = conn.host) }
-                val head = if (conn.viaDirect) {
-                    "✅ ${conn.label}（${conn.elapsedMs}ms）"
-                } else {
-                    "✅ ${conn.label}（${conn.elapsedMs}ms，经 Cloudflare）—— 传完仍会用 sha256 核对"
+                val head = when (conn.route) {
+                    TransferRoute.DIRECT -> "✅ ${conn.label}（${conn.elapsedMs}ms）"
+                    TransferRoute.HTTP ->
+                        "✅ ${conn.label}（${conn.elapsedMs}ms，经 Cloudflare 的 HTTP 通道）—— 传完按大小核对"
+                    TransferRoute.TUNNEL ->
+                        "⚠️ ${conn.label}（${conn.elapsedMs}ms）—— 只适合小操作，大文件会断，建议改成「自动」或「HTTP」"
+                    TransferRoute.AUTO -> "✅ ${conn.label}（${conn.elapsedMs}ms）"
                 }
                 val dir = _sshConfig.value.remoteDirForDisplay
                 val dirLine = try {
@@ -214,6 +222,8 @@ class MainScreenViewModel(context: Context) : ViewModel() {
             } catch (e: Exception) {
                 _uploadStatus.value = "❌ 上传失败：${SshErrors.describe(e)}"
             } finally {
+                // 传完之后这个目录的内容变了：把缓存作废，下次进来先核对再画
+                DirCache.invalidate(appContext, _sshConfig.value.remoteDir.trimEnd('/'))
                 _upload.value = UploadUiState()
                 uploadGuard.set(false)
             }
@@ -304,7 +314,13 @@ class MainScreenViewModel(context: Context) : ViewModel() {
 
     private val downloadGuard = AtomicBoolean(false)
 
-    /** 列远端目录（[dir] 为空则用配置里记住的浏览目录）。 */
+    /**
+     * 列远端目录（[dir] 为空则用配置里记住的浏览目录）。
+     *
+     * 2026-11-13 起是"缓存优先"：先把上次列过的结果**立刻**画出来（0ms），
+     * 再在后台带 `If-None-Match` 核对一次——服务端没变回 304（没有 body），界面不动；
+     * 变了才替换。这样进目录不用干等一个来回（隧道 RTT 实测 257–290ms，手机上更久）。
+     */
     fun listRemoteDir(dir: String? = null) {
         if (_download.value.running) return
         val target = (dir ?: _sshConfig.value.remoteBrowseDir).trim()
@@ -312,27 +328,117 @@ class MainScreenViewModel(context: Context) : ViewModel() {
             _downloadStatus.value = "远端目录不能为空"
             return
         }
-        _downloadStatus.value = "列目录中… $target"
+        updateSshConfig { it.copy(remoteBrowseDir = target) }
+
+        val cached = DirCache.get(appContext, target)
+        if (cached != null) {
+            _remoteListed.value = true
+            _remoteEntries.value = cached.entries.map {
+                RemoteEntryUi(it.name, it.size, it.dir, joinRemotePath(target, it.name))
+            }
+            _downloadStatus.value = "$target —— 缓存（${agoText(cached.at)}），正在核对…"
+        } else {
+            _downloadStatus.value = "列目录中… $target"
+        }
+
         viewModelScope.launch {
             try {
-                val entries = sshRepository.listDir(_sshConfig.value, target)
-                _remoteListed.value = true
-                updateSshConfig { it.copy(remoteBrowseDir = target) }
-                _remoteEntries.value = entries.map {
-                    RemoteEntryUi(it.name, it.size, it.dir, joinRemotePath(target, it.name))
-                }
-                val dirs = entries.count { it.dir }
-                val files = entries.size - dirs
-                _downloadStatus.value = buildString {
-                    append("$target —— $dirs 个目录 / $files 个文件")
-                    if (files > 0) append("（点文件名右边的「下载」）")
-                    if (target != "/") append("（点「上级」回上一层）")
+                when (val res = sshRepository.listDirResult(_sshConfig.value, target, cached?.etag)) {
+                    DirList.Unchanged -> {
+                        _remoteListed.value = true
+                        _downloadStatus.value = summarizeDir(target, cached?.entries ?: emptyList()) + "（没有变化）"
+                    }
+                    is DirList.Changed -> {
+                        DirCache.put(appContext, target, res.etag, res.entries)
+                        _remoteListed.value = true
+                        _remoteEntries.value = res.entries.map {
+                            RemoteEntryUi(it.name, it.size, it.dir, joinRemotePath(target, it.name))
+                        }
+                        _downloadStatus.value = summarizeDir(target, res.entries) + if (cached != null) "（已更新）" else ""
+                    }
                 }
             } catch (e: Exception) {
-                _remoteEntries.value = emptyList()
-                _downloadStatus.value = "❌ ${SshErrors.describe(e)}"
+                if (cached == null) {
+                    _remoteEntries.value = emptyList()
+                    _downloadStatus.value = "❌ ${SshErrors.describe(e)}"
+                } else {
+                    // 拉不动就保留已经画出来的缓存，别把界面清空
+                    _downloadStatus.value = "$target —— 显示缓存；刷新失败：${SshErrors.describe(e)}"
+                }
             }
         }
+    }
+
+    private fun summarizeDir(target: String, entries: List<RemoteEntry>): String {
+        val dirs = entries.count { it.dir }
+        val files = entries.size - dirs
+        return buildString {
+            append("$target —— $dirs 个目录 / $files 个文件")
+            if (files > 0) append("（点文件名右边的「下载」）")
+            if (target != "/") append("（点「上级」回上一层）")
+        }
+    }
+
+    private fun agoText(at: Long): String {
+        val ms = System.currentTimeMillis() - at
+        return when {
+            at <= 0 -> "时间未知"
+            ms < 60_000 -> "刚刚"
+            ms < 3_600_000 -> "${ms / 60_000} 分钟前"
+            ms < 86_400_000 -> "${ms / 3_600_000} 小时前"
+            else -> "${ms / 86_400_000} 天前"
+        }
+    }
+
+    // ------------------------------------------- ④ 搜索（按文件名，整个 /home/user）
+
+    /**
+     * 搜索走 HTTP 通道，**不依赖当前传输路线**：
+     * SFTP 那把 key 只允许 sftp 子系统，跑不了 find；而 HTTP 接口就是一条查询。
+     */
+    private val _searchHits = MutableStateFlow<List<RemoteEntryUi>>(emptyList())
+    val searchHits: StateFlow<List<RemoteEntryUi>> = _searchHits.asStateFlow()
+
+    private val _searchStatus = MutableStateFlow("")
+    val searchStatus: StateFlow<String> = _searchStatus.asStateFlow()
+
+    private val _searching = MutableStateFlow(false)
+    val searching: StateFlow<Boolean> = _searching.asStateFlow()
+
+    fun searchRemote(query: String) {
+        val q = query.trim()
+        if (q.isEmpty()) {
+            _searchHits.value = emptyList()
+            _searchStatus.value = "先输入要搜的文件名（支持部分匹配）"
+            return
+        }
+        val cfg = _sshConfig.value
+        _searching.value = true
+        _searchStatus.value = "搜索中…「$q」（服务器上跑 find，最深 6 层）"
+        viewModelScope.launch {
+            try {
+                val hits = withContext(Dispatchers.IO) {
+                    HttpTransferClient.search(cfg.httpBaseUrl, cfg.httpDeviceId, cfg.httpToken, cfg.remoteBrowseDir, q, 100)
+                }
+                _searchHits.value = hits.map { RemoteEntryUi(it.name, it.size, it.dir, it.path) }
+                val dirs = hits.count { it.dir }
+                _searchStatus.value = buildString {
+                    append("「$q」命中 ${hits.size} 项")
+                    if (hits.isNotEmpty()) append("（$dirs 个目录 / ${hits.size - dirs} 个文件）")
+                    append("；目录点「进入」，文件点「下载」")
+                }
+            } catch (e: Exception) {
+                _searchHits.value = emptyList()
+                _searchStatus.value = "❌ 搜索失败：${SshErrors.describe(e)}"
+            } finally {
+                _searching.value = false
+            }
+        }
+    }
+
+    fun clearSearch() {
+        _searchHits.value = emptyList()
+        _searchStatus.value = ""
     }
 
     fun openRemoteDir(path: String) = listRemoteDir(path)
@@ -411,7 +517,7 @@ class MainScreenViewModel(context: Context) : ViewModel() {
     private val _uploadDirStatus = MutableStateFlow("")
     val uploadDirStatus: StateFlow<String> = _uploadDirStatus.asStateFlow()
 
-    /** 列上传目标目录（⑥ 卡片的「远程目录」）。[dir] 为空则用配置里记住的上传目录。 */
+    /** 列上传目标目录（⑥ 卡片的「远程目录」）。[dir] 为空则用配置里记住的上传目录。同样缓存优先。 */
     fun listUploadDir(dir: String? = null) {
         if (_upload.value.running) return
         val target = (dir ?: _sshConfig.value.remoteDir).trim()
@@ -419,25 +525,52 @@ class MainScreenViewModel(context: Context) : ViewModel() {
             _uploadDirStatus.value = "远程目录不能为空"
             return
         }
-        _uploadDirStatus.value = "列目录中… $target"
+        updateSshConfig { it.copy(remoteDir = target) }
+
+        val cached = DirCache.get(appContext, target)
+        if (cached != null) {
+            _uploadDirListed.value = true
+            _uploadDirEntries.value = cached.entries.map {
+                RemoteEntryUi(it.name, it.size, it.dir, joinRemotePath(target, it.name))
+            }
+            _uploadDirStatus.value = "$target —— 缓存（${agoText(cached.at)}），正在核对…"
+        } else {
+            _uploadDirStatus.value = "列目录中… $target"
+        }
+
         viewModelScope.launch {
             try {
-                val entries = sshRepository.listDir(_sshConfig.value, target)
-                _uploadDirListed.value = true
-                updateSshConfig { it.copy(remoteDir = target) }
-                _uploadDirEntries.value = entries.map {
-                    RemoteEntryUi(it.name, it.size, it.dir, joinRemotePath(target, it.name))
-                }
-                val dirs = entries.count { it.dir }
-                val files = entries.size - dirs
-                _uploadDirStatus.value = buildString {
-                    append("$target —— $dirs 个目录 / $files 个文件")
-                    if (target != "/") append("（点「上级」回上一层）")
+                when (val res = sshRepository.listDirResult(_sshConfig.value, target, cached?.etag)) {
+                    DirList.Unchanged -> {
+                        _uploadDirListed.value = true
+                        _uploadDirStatus.value = summarizeUploadDir(target, cached?.entries ?: emptyList()) + "（没有变化）"
+                    }
+                    is DirList.Changed -> {
+                        DirCache.put(appContext, target, res.etag, res.entries)
+                        _uploadDirListed.value = true
+                        _uploadDirEntries.value = res.entries.map {
+                            RemoteEntryUi(it.name, it.size, it.dir, joinRemotePath(target, it.name))
+                        }
+                        _uploadDirStatus.value = summarizeUploadDir(target, res.entries) + if (cached != null) "（已更新）" else ""
+                    }
                 }
             } catch (e: Exception) {
-                _uploadDirEntries.value = emptyList()
-                _uploadDirStatus.value = "❌ ${SshErrors.describe(e)}"
+                if (cached == null) {
+                    _uploadDirEntries.value = emptyList()
+                    _uploadDirStatus.value = "❌ ${SshErrors.describe(e)}"
+                } else {
+                    _uploadDirStatus.value = "$target —— 显示缓存；刷新失败：${SshErrors.describe(e)}"
+                }
             }
+        }
+    }
+
+    private fun summarizeUploadDir(target: String, entries: List<RemoteEntry>): String {
+        val dirs = entries.count { it.dir }
+        val files = entries.size - dirs
+        return buildString {
+            append("$target —— $dirs 个目录 / $files 个文件")
+            if (target != "/") append("（点「上级」回上一层）")
         }
     }
 

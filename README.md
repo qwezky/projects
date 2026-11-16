@@ -15,7 +15,8 @@
 | [dsh-client](dsh-client/) | Java 17 / Swing / JSch | ~3.6k 行 | 用 SSH 本地转发把只监听 loopback 的 Web 界面搬到本机；支持 SSH over WebSocket |
 | [grounding-eval](grounding-eval/) | Python / PyTorch / MiniCheck | ~700 行 | 判断「抽出的待办有没有材料依据」：联合翻译 + 英文 MiniCheck，只打标不删除 |
 | [notice-radar](notice-radar/) | Python 标准库 | ~2.5k 行 | 校园通知聚合：抓取 → 正文/PDF/图片 OCR → 模型打分 → 日报 → webhook |
-| [android-transfer](android-transfer/) | Kotlin / Compose / JSch | ~2.8k 行 | 手机 ↔ 服务器 SFTP 双向传输；局域网只读 HTTP 分享；按网络类型选路 |
+| [android-transfer](android-transfer/) | Kotlin / Compose / JSch | ~4.6k 行 | 手机 ↔ 服务器双向传文件：SFTP 直连 + 隧道里的 HTTP 兜底；目录缓存、文件名搜索、断点续传 |
+| [android-journal](android-journal/) | Kotlin / Compose / JSch | ~5.1k 行 | 手机 → 服务器「存档投递」：文本/图片进收件目录 → 触发归档 → 按日期看待办；SFTP 与 HTTP 双通道 |
 
 ## 为什么值得看
 
@@ -46,7 +47,8 @@
 | dsh-client | `build-jar.sh` 编译通过（JDK 17 + JSch） |
 | grounding-eval | `py_compile`；需 MiniCheck 权重才能跑 |
 | notice-radar | `python3 notice_radar.py --help` / 空库 `stats` 正常 |
-| android-transfer | `./gradlew --offline :app:assembleDebug` 构建通过（JDK 17 / SDK 36） |
+| android-transfer | `./gradlew :app:compileDebugKotlin` 构建通过（JDK 17 / SDK 36） |
+| android-journal | `./gradlew :app:compileDebugKotlin` 构建通过（JDK 17 / SDK 36） |
 
 ## 说明
 

@@ -18,9 +18,7 @@ class SftpClient private constructor(
     private val session: Session,
     private val channel: ChannelSftp,
     private val wsFactory: WebSocketSshSocketFactory?,
-) : java.io.Closeable {
-
-    data class RemoteEntry(val name: String, val size: Long, val dir: Boolean, val modified: Int)
+) : RemoteClient {
 
     data class Options(
         val user: String,
@@ -104,8 +102,11 @@ class SftpClient private constructor(
         }
     }
 
+    override val label: String
+        get() = if (wsFactory != null) "SSH 隧道（WebSocket）" else "SSH ${session.host}"
+
     /** 传输中断时把 WebSocket 现场打出来（关闭码/原因/收发字节数）。 */
-    fun diagnostics(where: String) = wsFactory?.diagnostics(where) ?: println("WS诊断[$where] 本次是直连 TCP，无 WS 信息")
+    override fun diagnostics(where: String) = wsFactory?.diagnostics(where) ?: println("WS诊断[$where] 本次是直连 TCP，无 WS 信息")
 
     /**
      * 会话和通道是否都还活着。
@@ -113,11 +114,11 @@ class SftpClient private constructor(
      * 上传前必须问一句：失败后如果继续拿这条缓存连接去用，下一个文件会立刻报
      * "Pipe closed"，而错误信息看起来像目录问题（这就是真机上踩的那次）。
      */
-    val isAlive: Boolean
+    override val isAlive: Boolean
         get() = session.isConnected && channel.isConnected
 
     /** 上传（覆盖）；返回远端应有的字节数。 */
-    fun upload(local: File, remotePath: String, onProgress: (Long, Long) -> Unit = { _, _ -> }): Long {
+    override fun upload(local: File, remotePath: String, onProgress: (Long, Long) -> Unit): Long {
         val m = ProgressMonitor(
             total = local.length(), startOffset = 0,
             jschCountsStartOffset = false, onProgress = onProgress,
@@ -136,11 +137,11 @@ class SftpClient private constructor(
      *  - `init()` 之后会**先回调一次 `count(existing)`**（把"远端已有大小"当成第一次进度），
      *    所以进度累加时必须把这一次排除掉，否则进度会直接翻倍。
      */
-    fun resumeUpload(
+    override fun resumeUpload(
         local: File,
         remotePath: String,
         existing: Long,
-        onProgress: (Long, Long) -> Unit = { _, _ -> },
+        onProgress: (Long, Long) -> Unit,
     ): Long {
         val m = ProgressMonitor(
             total = local.length(), startOffset = existing,
@@ -176,11 +177,11 @@ class SftpClient private constructor(
      *   1.9GB/2GB 的进度接着下，不会再把 1.9GB 拉一遍）。
      * [resumeFrom] 必须等于 [dest] 里已有的字节数，否则拼出来的文件是错的。
      */
-    fun downloadTo(
+    override fun downloadTo(
         remotePath: String,
         dest: File,
-        resumeFrom: Long = 0,
-        onProgress: (Long, Long) -> Unit = { _, _ -> },
+        resumeFrom: Long,
+        onProgress: (Long, Long) -> Unit,
     ): Long {
         val total = remoteSize(remotePath)
         if (total < 0) throw IllegalStateException("远端没有这个文件：$remotePath")
@@ -212,7 +213,7 @@ class SftpClient private constructor(
      *     已经传上去的 93MB 白费。
      * 所以宁可不返回 -1：调用方想容忍"不确定"，用 [remoteSizeOrNull]。
      */
-    fun remoteSize(remotePath: String): Long =
+    override fun remoteSize(remotePath: String): Long =
         try {
             channel.stat(remotePath).size
         } catch (e: com.jcraft.jsch.SftpException) {
@@ -223,14 +224,14 @@ class SftpClient private constructor(
         }
 
     /** "问不到就当不知道"的版本：只用在"顺便看一下"的场景，不要用它做续传判断。 */
-    fun remoteSizeOrNull(remotePath: String): Long? =
+    override fun remoteSizeOrNull(remotePath: String): Long? =
         try {
             remoteSize(remotePath)
         } catch (e: Exception) {
             null
         }
 
-    fun list(remoteDir: String): List<RemoteEntry> {
+    override fun list(remoteDir: String): List<RemoteEntry> {
         @Suppress("UNCHECKED_CAST")
         val entries = channel.ls(remoteDir) as java.util.Vector<ChannelSftp.LsEntry>
         return entries
@@ -238,7 +239,7 @@ class SftpClient private constructor(
             .sortedBy { it.name }
     }
 
-    fun exists(remotePath: String): Boolean = remoteSize(remotePath) >= 0
+    override fun exists(remotePath: String): Boolean = remoteSize(remotePath) >= 0
 
     /**
      * 在**同一条 SSH 会话**上开一个 exec 通道跑 [command]，返回它的标准输出。
@@ -294,7 +295,7 @@ class SftpClient private constructor(
      *  - 查目录**失败**（会话死了等）→ 说"查目录失败"，不要把锅甩给目录；
      *  - 查到了确实不存在、创建又失败 → 才是"目录不存在且创建失败"。
      */
-    fun ensureDir(remoteDir: String): Boolean {
+    override fun ensureDir(remoteDir: String): Boolean {
         val dir = remoteDir.trimEnd('/')
         if (dir.isEmpty()) throw IllegalArgumentException("远程目录不能为空")
 
@@ -381,7 +382,7 @@ class SftpClient private constructor(
     }
 
     /** 读远程文本文件。用它读 `/proc/net/if_inet6` 做公网 IPv6 发现（免 DDNS）。 */
-    fun readText(remotePath: String): String =
+    override fun readText(remotePath: String): String =
         channel.get(remotePath).use { it.readBytes().toString(Charsets.UTF_8) }
 
     override fun close() {

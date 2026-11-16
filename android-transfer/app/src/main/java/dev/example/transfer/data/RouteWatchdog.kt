@@ -8,7 +8,7 @@ package dev.example.transfer.data
  *    只有真搬数据才会暴露成"每秒几十 KB"。
  *  - 观察窗 6 秒 + 至少搬过 512 KB，才排除掉启动抖动（JSch 建通道、目录自查这些开销）。
  *  - 速率下限 120 KB/s：广电移动数据直连实测 12–62 KB/s、校园网直连 ≈350 KB/s、
- *    Cloudflare 隧道服务器侧 1.06 MB/s；120 落在"坏路之上、好路之下"。
+ *    HTTP 通道实测 1.6–2.6 MB/s；120 落在"坏路之上、好路之下"。
  *
  * 两条都慢时返回 null（不换）—— 来回弹比慢更糟，交给原有的退避重试。
  */
@@ -18,9 +18,15 @@ internal object RouteWatchdog {
     const val SLOW_MIN_BYTES = 512L * 1024
     const val SLOW_FLOOR_BPS = 120.0 * 1024
 
-    /** 另一条路。 */
-    fun other(route: TransferRoute): TransferRoute =
-        if (route == TransferRoute.DIRECT) TransferRoute.TUNNEL else TransferRoute.DIRECT
+    /**
+     * 另一条路。只在「直连 ↔ HTTP」之间换：
+     *  - 隧道（SSH over WS）已经证实搬不动大文件（≥64KB 就被 QUIC 弄坏），不参与自动换路；
+     *  - 用户明确选了哪条，[decide] 的调用方也不会来问。
+     */
+    fun other(route: TransferRoute): TransferRoute = when (route) {
+        TransferRoute.DIRECT -> TransferRoute.HTTP
+        TransferRoute.HTTP, TransferRoute.TUNNEL, TransferRoute.AUTO -> TransferRoute.DIRECT
+    }
 
     /**
      * 返回**该切到哪条路**；null = 继续用当前这条。

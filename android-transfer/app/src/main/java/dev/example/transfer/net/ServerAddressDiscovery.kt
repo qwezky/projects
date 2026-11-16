@@ -18,7 +18,7 @@ object ServerAddressDiscovery {
 
     private const val DEFAULT_PROC_PATH = "/proc/net/if_inet6"
 
-    fun globalIpv6(client: SftpClient, procPath: String = DEFAULT_PROC_PATH): List<String> =
+    fun globalIpv6(client: RemoteClient, procPath: String = DEFAULT_PROC_PATH): List<String> =
         parseGlobalIpv6(client.readText(procPath))
 
     /**

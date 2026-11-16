@@ -501,9 +501,9 @@ class SftpE2ETest {
     @Test
     fun parses_proc_net_if_inet6() {
         val sample = """
-            fe800000000000005e879cfffee36836 03 40 20 80 wlp0s20f3
+            fe800000000000000000000000000001 03 40 20 80 eth0
             00000000000000000000000000000001 01 80 10 80       lo
-            240cc60330099e655e879cfffee36836 03 40 00 00 wlp0s20f3
+            20010db8000000000000000000000001 03 40 00 00 eth0
         """.trimIndent()
         val got = ServerAddressDiscovery.parseGlobalIpv6(sample)
         assertEquals(listOf("2001:db8::1"), got)

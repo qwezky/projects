@@ -5,7 +5,10 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
- * "直连差就走隧道"判据的单元测试。
+ * "这条路太慢就换另一条"判据的单元测试。
+ *
+ * 2026-11-12 起"另一条"是 **HTTP 通道**，不再是 SSH over WebSocket：
+ * 隧道那一跳 ≥64KB 就会把 SSH 流弄坏（sshd 报 MAC 校验失败），它不参与自动换路。
  *
  * 为什么值得钉住：这个判据一旦判错，后果是**静默**的 ——
  * 判太松（阈值偏高/窗口偏短）会把好链路误切到隧道，用户只觉得"怎么绕远路了"；
@@ -34,30 +37,39 @@ class RouteWatchdogTest {
     }
 
     @Test
-    fun 直连实测太慢时切隧道() {
+    fun 直连实测太慢时切HTTP() {
         // 10 秒搬 600 KB = 60 KB/s（广电移动数据直连的实测区间）
         assertEquals(
-            TransferRoute.TUNNEL,
+            TransferRoute.HTTP,
             RouteWatchdog.decide(TransferRoute.DIRECT, 10_000, 600L * 1024, emptySet()),
         )
     }
 
     @Test
-    fun 隧道实测太慢时切回直连() {
+    fun HTTP实测太慢时切回直连() {
         assertEquals(
             TransferRoute.DIRECT,
-            RouteWatchdog.decide(TransferRoute.TUNNEL, 10_000, 600L * 1024, emptySet()),
+            RouteWatchdog.decide(TransferRoute.HTTP, 10_000, 600L * 1024, emptySet()),
         )
     }
 
     @Test
     fun 两条都实测过太慢就不再换() {
-        // 直连已判慢、隧道也判慢 → 不来回弹
+        // 直连已判慢、HTTP 也判慢 → 不来回弹
         assertNull(
             RouteWatchdog.decide(
                 TransferRoute.DIRECT, 10_000, 600L * 1024,
-                setOf(TransferRoute.DIRECT, TransferRoute.TUNNEL),
+                setOf(TransferRoute.DIRECT, TransferRoute.HTTP),
             ),
+        )
+    }
+
+    @Test
+    fun 隧道那条不参与自动换路() {
+        // 用户在隧道上时被实测判慢：只换去直连，绝不回到隧道
+        assertEquals(
+            TransferRoute.DIRECT,
+            RouteWatchdog.decide(TransferRoute.TUNNEL, 10_000, 600L * 1024, emptySet()),
         )
     }
 
@@ -70,8 +82,10 @@ class RouteWatchdogTest {
 
     @Test
     fun 另一条路就是另一条() {
-        assertEquals(TransferRoute.TUNNEL, RouteWatchdog.other(TransferRoute.DIRECT))
+        assertEquals(TransferRoute.HTTP, RouteWatchdog.other(TransferRoute.DIRECT))
+        assertEquals(TransferRoute.DIRECT, RouteWatchdog.other(TransferRoute.HTTP))
         assertEquals(TransferRoute.DIRECT, RouteWatchdog.other(TransferRoute.TUNNEL))
+        assertEquals(TransferRoute.DIRECT, RouteWatchdog.other(TransferRoute.AUTO))
     }
 
     @Test
@@ -80,5 +94,6 @@ class RouteWatchdogTest {
         assertEquals(TransferRoute.AUTO, TransferRoute.of("随便"))
         assertEquals(TransferRoute.DIRECT, TransferRoute.of("direct"))
         assertEquals(TransferRoute.TUNNEL, TransferRoute.of("tunnel"))
+        assertEquals(TransferRoute.HTTP, TransferRoute.of("http"))
     }
 }

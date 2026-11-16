@@ -116,6 +116,9 @@ fun MainScreen(
     val download by viewModel.download.collectAsStateWithLifecycle()
     val downloadStatus by viewModel.downloadStatus.collectAsStateWithLifecycle()
     val remoteListed by viewModel.remoteListed.collectAsStateWithLifecycle()
+    val searchHits by viewModel.searchHits.collectAsStateWithLifecycle()
+    val searchStatus by viewModel.searchStatus.collectAsStateWithLifecycle()
+    val searching by viewModel.searching.collectAsStateWithLifecycle()
     val uploadDirEntries by viewModel.uploadDirEntries.collectAsStateWithLifecycle()
     val uploadDirListed by viewModel.uploadDirListed.collectAsStateWithLifecycle()
     val uploadDirStatus by viewModel.uploadDirStatus.collectAsStateWithLifecycle()
@@ -175,6 +178,11 @@ fun MainScreen(
         download = download,
         downloadStatus = downloadStatus,
         remoteListed = remoteListed,
+        searchHits = searchHits,
+        searchStatus = searchStatus,
+        searching = searching,
+        onSearch = viewModel::searchRemote,
+        onClearSearch = viewModel::clearSearch,
         onDelete = viewModel::delete,
         onShare = { shareFile(context, it) },
         onOpen = { if (it.name.endsWith(".apk", ignoreCase = true)) installApk(context, it) else openFile(context, it) },
@@ -215,6 +223,11 @@ private fun TransferContent(
     download: MainScreenViewModel.DownloadUiState,
     downloadStatus: String,
     remoteListed: Boolean,
+    searchHits: List<MainScreenViewModel.RemoteEntryUi>,
+    searchStatus: String,
+    searching: Boolean,
+    onSearch: (String) -> Unit,
+    onClearSearch: () -> Unit,
     onDelete: (File) -> Unit,
     onShare: (File) -> Unit,
     onOpen: (File) -> Unit,
@@ -235,6 +248,8 @@ private fun TransferContent(
     onSnackbar: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // ③ 的搜索关键词（只在界面上活，不持久化）
+    var searchQuery by remember { mutableStateOf("") }
     // ⑤ 上传的文本草稿
     var uploadTextDraft by remember { mutableStateOf("") }
     var uploadTextName by remember { mutableStateOf("") }
@@ -252,8 +267,8 @@ private fun TransferContent(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
         Text(
-            "手机 ↔ 服务器：同一条 IPv6 直连 + 同一把 SSH key（不经 Cloudflare）。" +
-                "存档（上传→服务端归档）已经拆成单独的「日志」App，这里只管传文件。",
+            "手机 ↔ 服务器：有 IPv6 就走直连（最快），没有就走 trans.example.com 的 HTTP 通道" +
+                "（走 Cloudflare 隧道，但不再套 SSH，能跑满这条链路）。存档已经拆成单独的「日志」App。",
             style = MaterialTheme.typography.bodySmall,
         )
 
@@ -274,6 +289,33 @@ private fun TransferContent(
                 modifier = Modifier.fillMaxWidth(),
             )
             Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = sshConfig.httpBaseUrl,
+                onValueChange = { v -> onSshConfigChange { it.copy(httpBaseUrl = v.trim()) } },
+                label = { Text("HTTP 通道地址（没有 IPv6 时走这条）") },
+                singleLine = true,
+                enabled = !upload.running,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = sshConfig.httpDeviceId,
+                onValueChange = { v -> onSshConfigChange { it.copy(httpDeviceId = v.trim()) } },
+                label = { Text("设备 ID（服务器登记的这台设备）") },
+                singleLine = true,
+                enabled = !upload.running,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = sshConfig.httpToken,
+                onValueChange = { v -> onSshConfigChange { it.copy(httpToken = v.trim()) } },
+                label = { Text("设备密钥（只对这一台有效，可单独吊销）") },
+                singleLine = true,
+                enabled = !upload.running,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 TextButton(enabled = !upload.running, onClick = { haptics.performHapticFeedback(HapticFeedbackType.Confirm); onShowPublicKey() }) { Text("我的公钥") }
                 Spacer(Modifier.width(4.dp))
@@ -288,7 +330,7 @@ private fun TransferContent(
         // ------------------------------------------------ ② 测试连接
         SectionCard(title = "测试连接", badge = "②") {
             Text(
-                "直连优先、失败退回隧道；成功后顺便报一下上传目录在不在。",
+                "直连优先；没有 IPv6 就自动走 HTTP 通道。成功后顺便报一下上传目录在不在。",
                 style = MaterialTheme.typography.bodySmall,
             )
             Spacer(Modifier.height(8.dp))
@@ -350,7 +392,7 @@ private fun TransferContent(
                 Spacer(Modifier.width(4.dp))
                 TextButton(enabled = !download.running, onClick = { haptics.performHapticFeedback(HapticFeedbackType.Confirm); onParentDir() }) { Text("上级") }
                 Spacer(Modifier.width(4.dp))
-                // 一次误触改乱浏览起点后，一键回到用户主目录（/home/user）
+                // 一次误触改乱浏览起点后，一键回到 user 的家目录（/home/user）
                 TextButton(
                     enabled = !download.running,
                     onClick = { haptics.performHapticFeedback(HapticFeedbackType.Confirm); onSshConfigChange { it.copy(remoteBrowseDir = SshConfig().remoteBrowseDir) } },
@@ -362,6 +404,58 @@ private fun TransferContent(
                         onClick = { downloadListOpen = false },
                     ) { Text("收起") }
                 }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "搜文件：不用一层层点进去。服务器上按文件名找（最深 6 层，跳过 node_modules/.git 这类目录），" +
+                    "搜到的目录点「进入」、文件点「下载」。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    label = { Text("文件名关键词（如 apk、录取、.pdf）") },
+                    singleLine = true,
+                    enabled = !searching,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(6.dp))
+                FilledTonalButton(
+                    enabled = !searching && searchQuery.isNotBlank(),
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+                        onSearch(searchQuery)
+                    },
+                ) { Text(if (searching) "…" else "搜索") }
+            }
+            if (searchStatus.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                StatusLine(searchStatus)
+                if (searchHits.isNotEmpty()) {
+                    TextButton(enabled = !searching, onClick = { haptics.performHapticFeedback(HapticFeedbackType.Confirm); onClearSearch() }) {
+                        Text("清除结果")
+                    }
+                }
+            }
+            if (searchHits.isNotEmpty()) {
+                SearchResults(
+                    hits = searchHits,
+                    busy = searching || download.running,
+                    onOpenDir = { e ->
+                        haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+                        searchQuery = e.path
+                        onOpenRemoteDir(e.path)
+                        downloadListOpen = true
+                    },
+                    onDownload = { e ->
+                        haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+                        onSnackbar("开始下载 ${e.name}")
+                        onDownloadRemote(e)
+                    },
+                )
             }
             if (download.running) {
                 Spacer(Modifier.height(8.dp))
@@ -598,17 +692,21 @@ private fun RoutePicker(route: String, enabled: Boolean, onChange: (TransferRout
     Text(
         when (TransferRoute.of(route)) {
             TransferRoute.AUTO ->
-                "自动：WiFi/有线走直连、移动数据走隧道；传的过程中发现太慢会自动换另一条" +
-                    "（靠断点续传接着搬，见下面阈值）。"
-            TransferRoute.DIRECT -> "始终直连 IPv6：校园网下最快（实测 0% 丢包、cwnd 38、RTT 30ms）。"
-            TransferRoute.TUNNEL -> "始终走 Cloudflare 隧道（SSH 装进 WebSocket，端到端加密），任何网络都能用。"
+                "自动：WiFi/有线先试直连，直连不通就走 HTTP；移动数据/VPN 直接走 HTTP。" +
+                    "传的过程中发现太慢会自动换另一条（靠断点续传接着搬，见下面阈值）。"
+            TransferRoute.DIRECT -> "始终直连 IPv6：校园网下最快（实测 0% 丢包、cwnd 38、RTT 30ms、调参后 67 MB/s）。" +
+                "不通就报错，不会偷偷换成别的路。"
+            TransferRoute.HTTP -> "始终走 trans.example.com 的 HTTP 通道（没有 IPv6 也能用）：" +
+                "实测上传 2.4–2.6 MB/s、下载 1.6–3.1 MB/s，支持断点续传，传完按大小核对。"
+            TransferRoute.TUNNEL -> "始终走 Cloudflare 隧道里的 SSH-over-WebSocket：任何网络能建会话，" +
+                "但大文件会被 QUIC 那一跳弄坏（≥64KB 就 MAC 校验失败），只留给小操作/救急。"
         },
         style = MaterialTheme.typography.bodySmall,
     )
     Spacer(Modifier.height(2.dp))
     Text(
-        "换路判据：观察 6 秒、至少搬过 512 KB，速率低于 120 KB/s 就换另一条。" +
-            "（广电移动数据直连实测 12–62 KB/s、校园网直连 ≈350 KB/s、隧道服务器侧 1.06 MB/s）",
+        "换路判据：观察 6 秒、至少搬过 512 KB，速率低于 120 KB/s 就在「直连 ↔ HTTP」之间换。" +
+            "（广电移动数据直连实测 12–62 KB/s、校园网直连 ≈350 KB/s、HTTP 通道 1.6–2.6 MB/s）",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.outline,
     )
@@ -641,6 +739,62 @@ private fun GrowingPathField(
             enabled = enabled,
             modifier = Modifier.width(width),
         )
+    }
+}
+
+/**
+ * 搜索结果列表。和 [RemoteListing] 的区别：这里的命中来自不同目录，
+ * 所以要显示**所在目录**（不然一堆同名文件分不清是谁）。
+ */
+@Composable
+private fun SearchResults(
+    hits: List<MainScreenViewModel.RemoteEntryUi>,
+    busy: Boolean,
+    onOpenDir: (MainScreenViewModel.RemoteEntryUi) -> Unit,
+    onDownload: (MainScreenViewModel.RemoteEntryUi) -> Unit,
+) {
+    Spacer(Modifier.height(4.dp))
+    hits.take(100).forEach { hit ->
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(if (hit.dir) R.drawable.ic_folder else R.drawable.ic_file),
+                contentDescription = if (hit.dir) "目录" else "文件",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = hit.name,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = hit.path.substringBeforeLast('/', ""),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+            if (!hit.dir) {
+                Text(HttpFileServer.humanSize(hit.size), style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.width(4.dp))
+            }
+            if (hit.dir) {
+                TextButton(enabled = !busy, onClick = { onOpenDir(hit) }) { Text("进入") }
+            } else {
+                TextButton(enabled = !busy, onClick = { onDownload(hit) }) { Text("下载") }
+            }
+        }
+        HorizontalDivider()
+    }
+    if (hits.size > 100) {
+        Text("（只显示了前 100 项）", style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -1042,6 +1196,11 @@ private fun TransferContentPreview() {
             download = MainScreenViewModel.DownloadUiState(),
             downloadStatus = "/home/user —— 3 个目录 / 7 个文件",
             remoteListed = true,
+            searchHits = emptyList(),
+            searchStatus = "",
+            searching = false,
+            onSearch = {},
+            onClearSearch = {},
             onDelete = {},
             onShare = {},
             onOpen = {},

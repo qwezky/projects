@@ -69,8 +69,8 @@ public final class DshClient {
      * 历史版本内置过的默认值。老安装的 `~/.dsh-client.properties` 里存的是它们的字面量，
      * 那是"写死的旧值"而不是用户的选择 —— 载入时迁移成 `auto`，否则升级后依旧会连旧地址。
      */
-    static final String LEGACY_HOST = "2001:db8::2:5e87:9cff:fee3:6836";
-    static final String LEGACY_TOKEN = "xEsipm3f0RrCqgofUDjcFe7vuttpkbHx2hCloyVOcrQ";
+    static final String LEGACY_HOST = "2001:db8::2";
+    static final String LEGACY_TOKEN = "";
     /** SSH over WebSocket 的地址（tunnel 模式） */
     static final String DEFAULT_TUNNEL_HOST = "ssh.example.com";
     static final String DEFAULT_TUNNEL_WS = "wss://ssh.example.com/";
@@ -85,7 +85,7 @@ public final class DshClient {
         /** 设置值：`auto`（默认，经隧道发现）或 IPv6/域名（用户指定就不去发现）。 */
         String host = AUTO;
         int port = 22;
-        String user = "tudi";
+        String user = "user";
         String key = detectKeyPath();
         /** 本机监听端口（浏览器访问的那个） */
         int localPort = 3080;
@@ -1724,7 +1724,7 @@ public final class DshClient {
 
                 其它：
                   --port <SSH 端口>      默认 22
-                  --user <用户名>        默认 tudi
+                  --user <用户名>        默认 user
                   --key <私钥路径>       默认 %s
                   --local-port <端口>    本机监听端口，默认 3080（填 0 = 只建 WB 那条转发，排错用）
 

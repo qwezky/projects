@@ -8,6 +8,10 @@ import com.jcraft.jsch.KeyPair
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import dev.example.transfer.net.DirList
+import dev.example.transfer.net.HttpTransferClient
+import dev.example.transfer.net.RemoteClient
+import dev.example.transfer.net.RemoteEntry
 import dev.example.transfer.net.ServerAddressDiscovery
 import dev.example.transfer.net.SftpClient
 import dev.example.transfer.net.SshErrors
@@ -25,16 +29,23 @@ data class UploadItem(
     val mime: String? = null,
 )
 
-/** 连接结果：走了哪条路、发现了什么地址、耗时多少。 */
+/** 连接结果：走了哪条路、连到哪里、耗时多少。 */
 data class SshConnection(
-    val client: SftpClient,
-    val viaDirect: Boolean,
+    val client: RemoteClient,
+    val route: TransferRoute,
     val host: String,
     val discoveredIpv6: List<String>,
     val elapsedMs: Long,
 ) {
+    val viaDirect: Boolean get() = route == TransferRoute.DIRECT
+
     val label: String
-        get() = if (viaDirect) "直连 $host" else "经隧道（$host）"
+        get() = when (route) {
+            TransferRoute.DIRECT -> "直连 $host"
+            TransferRoute.HTTP -> "HTTP ${host.removePrefix("https://").removePrefix("http://")}"
+            TransferRoute.TUNNEL -> "经 SSH 隧道（$host）"
+            TransferRoute.AUTO -> host
+        }
 }
 
 /** 一次上传的最终结果。 */
@@ -77,8 +88,8 @@ class SshUploadRepository(private val context: Context) {
         /** 经隧道 / 正式建会话的超时 */
         const val CONNECT_TIMEOUT_MS = 20_000
 
-        /** 直连探测用短超时：避免 IPv6 黑洞化时退回隧道前干等太久 */
-        const val PROBE_CONNECT_TIMEOUT_MS = 6_000
+        /** 直连探测用短超时：避免 IPv6 黑洞化时退回 HTTP 前干等太久（6s 太长，实测 3s 够判断） */
+        const val PROBE_CONNECT_TIMEOUT_MS = 3_000
 
         /** 会话读超时（session.timeout）。传输中长时间没有数据才算死 */
         const val READ_TIMEOUT_MS = 60_000
@@ -171,8 +182,7 @@ class SshUploadRepository(private val context: Context) {
     @Volatile
     private var pendingRouteSwitch: TransferRoute? = null
 
-    private fun currentRoute(conn: SshConnection): TransferRoute =
-        if (conn.viaDirect) TransferRoute.DIRECT else TransferRoute.TUNNEL
+    private fun currentRoute(conn: SshConnection): TransferRoute = conn.route
 
     /** 重试循环里调用：把看门狗的决定落到 [routeOverride]。 */
     private fun applyPendingRouteSwitch() {
@@ -249,77 +259,103 @@ class SshUploadRepository(private val context: Context) {
     }
 
     /**
-     * 建立会话：优先直连（快、批量传输可靠），失败才退回隧道（任何网络都能通，但批量不行）。
-     * 整个过程在 IO 线程上跑。
+     * 建立会话。选路顺序（2026-11-12 改）：
+     *
+     *  1. 用户明确选「隧道」→ 直接 SSH-over-WS（只适合小操作）。
+     *  2. 「自动」在移动数据/VPN/未知网络上 → 先 HTTP（这种网络基本没有可用的 IPv6）。
+     *  3. 试已知的直连地址（手填 / 上次成功）；没有已知地址时先问服务器自己的公网 IPv6
+     *     （HTTP 一条 /api/hostinfo，比开一条 SSH 会话去读 /proc/net/if_inet6 便宜得多）。
+     *  4. 直连不通 → HTTP。
+     *  5. 还不行 → SSH-over-WS 兜底。
+     *  6. 用户明确选「直连」而直连不通 → 直接报错，不悄悄换成别的路。
+     *
+     * 为什么不再像以前那样"先开隧道再拿发现的地址试直连"：隧道握手本身要 ~2s，
+     * 而 HTTP 的 /api/hostinfo 一个请求就拿到了同一个信息。
      */
     suspend fun connect(config: SshConfig): SshConnection = withContext(Dispatchers.IO) {
         directFailures.clear()
         val started = System.currentTimeMillis()
-
-        // 0) 先按"用户选的路 / 网络类型 / 上一次的实测结论"决定要不要直接走隧道。
-        //    为什么要这一步：坏路上直连能连上只是慢，先拿直连去撞会白等一轮（还在慢速里搬数据）。
         val configured = TransferRoute.of(config.route)
-        val preferTunnel = when {
-            configured == TransferRoute.DIRECT -> false
-            configured == TransferRoute.TUNNEL -> true
-            routeOverride == TransferRoute.TUNNEL -> true
+
+        // 1) 明确要隧道（老路，保留给"只想做小操作/临时救援"的场景）
+        if (configured == TransferRoute.TUNNEL) return@withContext openTunnel(config, started)
+
+        // 2) 先 HTTP 还是先直连
+        val preferHttp = when {
+            routeOverride == TransferRoute.HTTP -> true
             routeOverride == TransferRoute.DIRECT -> false
-            else -> RouteChooser.preferTunnel(context, configured)
+            else -> RouteChooser.preferHttp(context, configured)
         }
-        if (preferTunnel) {
-            try {
-                val tunnel = SftpClient.open(options(config, config.tunnelHostName, config.tunnelWsUrl))
-                var discovered: List<String> = emptyList()
-                try {
-                    discovered = ServerAddressDiscovery.globalIpv6(tunnel)
-                } catch (e: Exception) {
-                    directFailures += "经隧道读 /proc/net/if_inet6 失败：${SshErrors.describe(e)}"
-                }
-                return@withContext SshConnection(
-                    client = tunnel,
-                    viaDirect = false,
-                    host = config.tunnelWsUrl,
-                    discoveredIpv6 = discovered,
-                    elapsedMs = System.currentTimeMillis() - started,
-                )
+        if (preferHttp) tryHttp(config, started)?.let { return@withContext it }
+
+        // 3) 直连：已知地址优先；一个都没有就先问服务器自己的公网 IPv6
+        var candidates = config.candidatesForDirect()
+        if (candidates.isEmpty()) {
+            candidates = try {
+                HttpTransferClient.probeIpv6(config.httpBaseUrl, config.httpDeviceId, config.httpToken)
             } catch (e: Exception) {
-                // 隧道自己开不起来（比如没有到 CF 的网）→ 继续往下试直连，别把路堵死
-                directFailures += "隧道失败：${SshErrors.describe(e)}"
+                directFailures += "查服务器 IPv6 失败：${SshErrors.describe(e)}"
+                emptyList()
+            }
+        }
+        for (host in candidates) {
+            tryDirect(config, host)?.let {
+                return@withContext it.copy(elapsedMs = System.currentTimeMillis() - started)
             }
         }
 
-        // 1) 先试已知的直连地址（手填的、上次成功的）—— 不需要隧道，最快
-        for (host in config.candidatesForDirect()) {
-            tryDirect(config, host)?.let { return@withContext it.copy(elapsedMs = System.currentTimeMillis() - started) }
+        // 4) 用户明确要直连：不通就直说，别把 HTTP 当成直连糊弄过去
+        if (configured == TransferRoute.DIRECT) {
+            throw IllegalStateException(
+                "直连不通：" + (directFailures.joinToString("；").ifBlank { "没有可用的 IPv6 地址" }) +
+                    "\n（想要「没有 IPv6 也能传」，把路线改成「自动」或「HTTP」）",
+            )
         }
 
-        // 2) 经隧道建立会话（同时用它做 IPv6 发现）
-        val tunnel = SftpClient.open(options(config, config.tunnelHostName, config.tunnelWsUrl))
+        // 5) 直连不通 → HTTP
+        if (!preferHttp) tryHttp(config, started)?.let { return@withContext it }
+
+        // 6) 兜底：SSH-over-WS
+        openTunnel(config, started)
+    }
+
+    /** 用 HTTP 通道连（没有 IPv6 时的正路）。失败返回 null，由调用方继续往下试。 */
+    private fun tryHttp(config: SshConfig, started: Long): SshConnection? =
+        try {
+            val c = HttpTransferClient.open(config.httpBaseUrl, config.httpDeviceId, config.httpToken, CONNECT_TIMEOUT_MS)
+            SshConnection(
+                client = c,
+                route = TransferRoute.HTTP,
+                host = config.httpBaseUrl,
+                discoveredIpv6 = emptyList(),
+                elapsedMs = System.currentTimeMillis() - started,
+            )
+        } catch (e: Exception) {
+            directFailures += "HTTP 通道失败：${SshErrors.describe(e)}"
+            null
+        }
+
+    /** SSH over WebSocket：任何网络都能建会话，但大文件会被 QUIC 那一跳弄坏。 */
+    private fun openTunnel(config: SshConfig, started: Long): SshConnection {
+        val tunnel = try {
+            SftpClient.open(options(config, config.tunnelHostName, config.tunnelWsUrl))
+        } catch (e: Exception) {
+            directFailures += "隧道失败：${SshErrors.describe(e)}"
+            throw IllegalStateException(
+                "连不上服务器：" + directFailures.joinToString("；").ifBlank { SshErrors.describe(e) },
+                e,
+            )
+        }
         var discovered: List<String> = emptyList()
         try {
             discovered = ServerAddressDiscovery.globalIpv6(tunnel)
         } catch (e: Exception) {
             directFailures += "经隧道读 /proc/net/if_inet6 失败：${SshErrors.describe(e)}"
         }
-
-        // 3) 用发现的地址试直连
-        for (host in discovered) {
-            if (host in config.candidatesForDirect()) continue
-            val direct = tryDirect(config, host)
-            if (direct != null) {
-                runCatching { tunnel.close() }
-                return@withContext direct.copy(
-                    elapsedMs = System.currentTimeMillis() - started,
-                    discoveredIpv6 = discovered,
-                )
-            }
-        }
-
-        // 4) 退回隧道
-        SshConnection(
+        return SshConnection(
             client = tunnel,
-            viaDirect = false,
-            host = config.tunnelWsUrl,
+            route = TransferRoute.TUNNEL,
+            host = config.tunnelHostName,
             discoveredIpv6 = discovered,
             elapsedMs = System.currentTimeMillis() - started,
         )
@@ -329,9 +365,9 @@ class SshUploadRepository(private val context: Context) {
         try {
             // 探测用**短**超时：直连一旦建好会话就不再受这个值限制（它只管 TCP 连接 + 握手；
             // 认证成功后 JSch 会把 socket 的读超时改回 session.timeout，这一点字节码核对过），
-            // 但 IPv6 黑洞化时能让"退回隧道"快很多，而不是干等 20 秒 × 候选数。
+            // 但 IPv6 黑洞化时能让"退回 HTTP"快很多，而不是干等 20 秒 × 候选数。
             val c = SftpClient.open(options(config, host, null, connectTimeoutMs = PROBE_CONNECT_TIMEOUT_MS))
-            SshConnection(c, viaDirect = true, host = host, discoveredIpv6 = emptyList(), elapsedMs = 0)
+            SshConnection(c, TransferRoute.DIRECT, host, emptyList(), 0)
         } catch (e: Exception) {
             directFailures += "直连 $host 失败：${SshErrors.describe(e)}"
             null
@@ -590,8 +626,29 @@ class SshUploadRepository(private val context: Context) {
     // 和上传是**同一条通道、同一把 key、同一套调参**：手机主动连服务器的 22 端口（IPv6 直连优先），
     // 走 SFTP。这样两个方向都不需要 Cloudflare 隧道、不需要额外开监听端口、不需要浏览器 token。
 
+    /**
+     * 带版本号列目录：服务端内容没变就返回 [DirList.Unchanged]（HTTP 侧是真 304，没有 body）。
+     * 上层拿它配 [dev.example.transfer.data.DirCache] 做"缓存秒开 + 后台核对"。
+     */
+    suspend fun listDirResult(config: SshConfig, dir: String, etag: String?): DirList =
+        withContext(Dispatchers.IO) {
+            val target = dir.trim()
+            if (target.isEmpty()) throw IllegalArgumentException("远端目录不能为空")
+            val conn = try {
+                ensureConnection(config)
+            } catch (e: Exception) {
+                throw IllegalStateException("连接失败：${SshErrors.describe(e)}", e)
+            }
+            try {
+                conn.client.listWithEtag(target, etag)
+            } catch (e: Exception) {
+                if (SshErrors.isSessionDead(e)) invalidateConnection(SshErrors.describe(e))
+                throw IllegalStateException("列目录失败（$target）：${SshErrors.describe(e)}", e)
+            }
+        }
+
     /** 列远端目录：目录在前、文件在后，各自按名字排序。 */
-    suspend fun listDir(config: SshConfig, dir: String): List<SftpClient.RemoteEntry> =
+    suspend fun listDir(config: SshConfig, dir: String): List<RemoteEntry> =
         withContext(Dispatchers.IO) {
             val target = dir.trim()
             if (target.isEmpty()) throw IllegalArgumentException("远端目录不能为空")
@@ -603,7 +660,7 @@ class SshUploadRepository(private val context: Context) {
             try {
                 conn.client.list(target)
                     .filter { it.name != "." && it.name != ".." }
-                    .sortedWith(compareByDescending<SftpClient.RemoteEntry> { it.dir }.thenBy { it.name.lowercase() })
+                    .sortedWith(compareByDescending<RemoteEntry> { it.dir }.thenBy { it.name.lowercase() })
             } catch (e: Exception) {
                 if (SshErrors.isSessionDead(e)) invalidateConnection(SshErrors.describe(e))
                 throw IllegalStateException("列目录失败（$target）：${SshErrors.describe(e)}", e)
