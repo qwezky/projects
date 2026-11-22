@@ -104,28 +104,65 @@ public final class RouteProbe {
      * 宁可多探一次，也不要因为读不到网卡信息就把人钉死在隧道上。
      */
     public static boolean hasGlobalIpv6() {
+        return findGlobalIpv6() != null;
+    }
+
+    /**
+     * 本机有没有可用的全局 IPv6；有就返回"网卡名 + 地址"，没有返回 null。
+     *
+     * <p>3.2.2 起不再用网卡名黑名单直接排除（以前的 docker/veth/vEthernet 名单在 Windows 上
+     * 有可能误伤真正的网卡），改成只看地址本身：非回环、非链路本地、非组播、非 ULA（fc00::/7）。
+     * 只在"是虚拟网卡且只有链路本地地址"这种本来就判 false 的情况下才会被跳过。
+     */
+    public static String[] findGlobalIpv6() {
         try {
             java.util.Enumeration<java.net.NetworkInterface> ifs = java.net.NetworkInterface.getNetworkInterfaces();
             while (ifs != null && ifs.hasMoreElements()) {
                 java.net.NetworkInterface ni = ifs.nextElement();
                 if (!ni.isUp() || ni.isLoopback()) continue;
-                String n = ni.getName() == null ? "" : ni.getName().toLowerCase();
-                if (n.startsWith("docker") || n.startsWith("veth") || n.startsWith("br-")
-                        || n.startsWith("virbr") || n.startsWith("tun") || n.startsWith("tap")
-                        || n.startsWith("wg") || n.startsWith("vethernet")) continue;
                 for (java.net.InterfaceAddress ia : ni.getInterfaceAddresses()) {
                     java.net.InetAddress a = ia.getAddress();
-                    if (a instanceof java.net.Inet6Address
-                            && !a.isLoopbackAddress() && !a.isLinkLocalAddress()
-                            && !a.isMulticastAddress() && !a.isSiteLocalAddress()) {
-                        return true;
-                    }
+                    if (!(a instanceof java.net.Inet6Address)) continue;
+                    if (a.isLoopbackAddress() || a.isLinkLocalAddress() || a.isMulticastAddress()) continue;
+                    byte[] raw = a.getAddress();
+                    if (raw != null && raw.length == 16 && (raw[0] & 0xFE) == 0xFC) continue;   // ULA fc00::/7，不是公网
+                    return new String[]{ni.getName(), a.getHostAddress().split("%", 2)[0]};
                 }
             }
         } catch (Exception ignore) {
-            return true;
+            return new String[]{"(枚举异常)", "?"};
         }
-        return false;
+        return null;
+    }
+
+    /**
+     * 把"这台机器到底有哪些 IPv6"拍成一行，用来解释"为什么没选直连"。
+     * 采集失败也要说清楚失败原因，不能静默。
+     */
+    public static String ipv6Inventory() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> ifs = java.net.NetworkInterface.getNetworkInterfaces();
+            while (ifs != null && ifs.hasMoreElements()) {
+                java.net.NetworkInterface ni = ifs.nextElement();
+                if (ni.isLoopback()) continue;
+                StringBuilder one = new StringBuilder();
+                for (java.net.InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    java.net.InetAddress a = ia.getAddress();
+                    if (!(a instanceof java.net.Inet6Address)) continue;
+                    if (one.length() > 0) one.append(", ");
+                    one.append(a.getHostAddress().split("%", 2)[0]);
+                    if (a.isLinkLocalAddress()) one.append("(链路本地)");
+                    else if (a.isMulticastAddress()) one.append("(组播)");
+                }
+                if (one.length() > 0) {
+                    sb.append(ni.getName()).append(ni.isUp() ? "" : "[down]").append(": ").append(one).append("；");
+                }
+            }
+        } catch (Exception e) {
+            return "枚举网卡失败：" + e;
+        }
+        return sb.length() == 0 ? "没枚举到任何 IPv6 地址" : sb.toString();
     }
 
     private RouteProbe() {

@@ -46,7 +46,7 @@ public final class DshClient {
     static final String DEFAULT_TOKEN = "";
     /** 网页隧道（web 模式）的地址 */
     /** 版本号 —— **由 build-jar.sh 按参数自动写入**（别手改，改了就两边不一致）。 */
-    static final String VERSION = "3.0.9";
+    static final String VERSION = "3.2.3";
 
     static final String DEFAULT_WEB_URL = "https://dsh.example.com/";
     /**
@@ -69,8 +69,8 @@ public final class DshClient {
      * 历史版本内置过的默认值。老安装的 `~/.dsh-client.properties` 里存的是它们的字面量，
      * 那是"写死的旧值"而不是用户的选择 —— 载入时迁移成 `auto`，否则升级后依旧会连旧地址。
      */
-    static final String LEGACY_HOST = "2001:db8::2";
-    static final String LEGACY_TOKEN = "";
+    static final String LEGACY_HOST = "2001:db8::2:5e87:9cff:fee3:6836";
+    static final String LEGACY_TOKEN = "xEsipm3f0RrCqgofUDjcFe7vuttpkbHx2hCloyVOcrQ";
     /** SSH over WebSocket 的地址（tunnel 模式） */
     static final String DEFAULT_TUNNEL_HOST = "ssh.example.com";
     static final String DEFAULT_TUNNEL_WS = "wss://ssh.example.com/";
@@ -85,7 +85,7 @@ public final class DshClient {
         /** 设置值：`auto`（默认，经隧道发现）或 IPv6/域名（用户指定就不去发现）。 */
         String host = AUTO;
         int port = 22;
-        String user = "user";
+        String user = "tudi";
         String key = detectKeyPath();
         /** 本机监听端口（浏览器访问的那个） */
         int localPort = 3080;
@@ -175,8 +175,37 @@ public final class DshClient {
         String resolveNote = "";
     }
 
+    /**
+     * 把 JSch 自己的日志接进 {@code ~/.dsh-client.log}。
+     *
+     * <p>3.1.1：客户端"隧道断了"以前只有一句现象，看不出是**对端 reset**、**keepalive 超时**，
+     * 还是**我们自己断开**。JSch 在连不上/被断开时会把原因打给它的 Logger，这里全收进运行期日志，
+     * 下次掉线把 {@code .dsh-client.log} 发出来就能对号入座。
+     * 想看更细的（每条报文）：加 {@code -Ddsh.ssh.debug=1}。
+     */
+    private static void installSshLogger() {
+        try {
+            final boolean verbose = "1".equals(System.getProperty("dsh.ssh.debug"))
+                    || "1".equals(System.getenv("DSH_SSH_DEBUG"));
+            com.jcraft.jsch.JSch.setLogger(new com.jcraft.jsch.Logger() {
+                @Override
+                public boolean isEnabled(int level) {
+                    return verbose || level >= com.jcraft.jsch.Logger.INFO;
+                }
+
+                @Override
+                public void log(int level, String message) {
+                    Startup.runtime("[jsch] " + message);
+                }
+            });
+        } catch (Throwable ignore) {
+            // 日志装不上不影响连接
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         Startup.install();
+        installSshLogger();
         Startup.startEdtWatchdog();
         // 顶层兜底：任何启动期异常都要"看得见"，别让窗口一闪就没了
         Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
@@ -415,7 +444,10 @@ public final class DshClient {
                     + "若它也不通会自动退网页隧道";
             return RouteProbe.Route.TUNNEL;
         }
-        RouteProbe.Result r = RouteProbe.probe(cfg.hostResolved, cfg.port, 10, 5, 300, 3_000);
+        // 3.2.1：判据放宽 —— 以前 10 次里错 1 次（10% > 5%）或最好一次慢于 300ms 就判直连"不行"，
+        // 而 IPv6 首包/RA 刚收敛时经常正好落在这个灰区，于是自动路线几乎总选到隧道（传大文件就断）。
+        // 现在：允许 10% 握手失败、最好一次 800ms 以内都算直连可用。
+        RouteProbe.Result r = RouteProbe.probe(cfg.hostResolved, cfg.port, 10, 10, 800, 3_000);
         lastProbe = r;
         if (cfg.mobileRttMs > 0 && r.bestMs >= cfg.mobileRttMs) {
             routeReason = "路线：握手 RTT " + r.bestMs + "ms ≥ " + cfg.mobileRttMs
@@ -891,8 +923,12 @@ public final class DshClient {
         if (rttMobile && webKbps > 0) return "web";
         boolean mobileLike = bestSsh >= 0 && mobileFloorKbps > 0 && bestSsh < mobileFloorKbps;
         if (mobileLike && webKbps > 0 && (bestSsh <= 0 || webKbps >= bestSsh * 1.05)) return "web";
-        // 两条 SSH 比：域名要快 15% 以上才顶掉直连
-        if (directKbps > 0 && tunnelKbps > 0) return tunnelKbps > directKbps * 1.15 ? "tunnel" : "direct";
+        // 两条 SSH 比：**直连只要能用，就用直连**（3.2.1 改的口径）
+        //
+        // 以前是"域名快 15% 以上就顶掉直连"。问题在于：这个速度是**下载**测出来的（SFTP 读 /bin/bash），
+        // 而坏的是**上传**方向 —— 域名那条是 SSH over WebSocket，实测传大文件必断（Cloudflare /
+        // cloudflared 那一跳扛不住突发）。下载快 ≠ 上传能用，用下载速度去选上传路径，选错是必然的。
+        // 所以现在只有"直连连上了但一个字节都量不出来"才换域名。
         if (directKbps > 0) return "direct";
         if (tunnelKbps > 0) return "tunnel";
         return webKbps > 0 ? "web" : "direct";
@@ -1724,7 +1760,7 @@ public final class DshClient {
 
                 其它：
                   --port <SSH 端口>      默认 22
-                  --user <用户名>        默认 user
+                  --user <用户名>        默认 tudi
                   --key <私钥路径>       默认 %s
                   --local-port <端口>    本机监听端口，默认 3080（填 0 = 只建 WB 那条转发，排错用）
 

@@ -22,6 +22,27 @@ final class Startup {
 
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
     private static final File LOG = new File(System.getProperty("user.home"), ".dsh-client-startup.log");
+    /** 运行期日志（界面「日志」页签的每一行也落一份）：排查"掉线/重连"时直接看这个文件。 */
+    private static final File RUNLOG = new File(System.getProperty("user.home"), ".dsh-client.log");
+    /** 写盘放到自己的线程里：logLine 在 EDT 上跑，不能让磁盘 I/O 卡界面。队列满就丢行。 */
+    private static final java.util.concurrent.BlockingQueue<String> RUNQ =
+            new java.util.concurrent.LinkedBlockingQueue<>(4096);
+
+    static {
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    appendTo(RUNLOG, 2 * 1024 * 1024, RUNQ.take());
+                } catch (InterruptedException ie) {
+                    return;
+                } catch (Throwable ignore) {
+                    // 日志失败绝不能影响运行
+                }
+            }
+        }, "dsh-runlog");
+        t.setDaemon(true);
+        t.start();
+    }
 
     private Startup() {
     }
@@ -89,6 +110,16 @@ final class Startup {
         append(LocalDateTime.now().format(TS) + "  " + msg);
     }
 
+    /** 运行期日志：界面「日志」页签的每一行都调这里（异步落盘，绝不在 EDT 上做 I/O）。 */
+    static void runtime(String msg) {
+        try {
+            RUNQ.offer(LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm:ss"))
+                    + "  " + msg);
+        } catch (Throwable ignore) {
+            // 队列满/线程已退出：宁可少一行也不能抛
+        }
+    }
+
     /** 带堆栈的错误。 */
     static void error(String msg, Throwable e) {
         append(LocalDateTime.now().format(TS) + "  [ERROR] " + msg
@@ -107,19 +138,22 @@ final class Startup {
     }
 
     private static synchronized void append(String line) {
+        appendTo(LOG, 512 * 1024, line);
+    }
+
+    /** 超过上限就改名成 .old（只留一份备份），然后继续追加。 */
+    private static synchronized void appendTo(File f, long maxBytes, String line) {
         try {
-            if (LOG.length() > 512 * 1024) {
-                File old = new File(LOG.getParentFile(), LOG.getName() + ".old");
-                // 直接覆盖旧备份，不做多份轮转
-                LOG.renameTo(old);
+            if (f.length() > maxBytes) {
+                f.renameTo(new File(f.getParentFile(), f.getName() + ".old"));
             }
             try (OutputStreamWriter w = new OutputStreamWriter(
-                    new FileOutputStream(LOG, true), StandardCharsets.UTF_8)) {
+                    new FileOutputStream(f, true), StandardCharsets.UTF_8)) {
                 w.write(line);
                 w.write(System.lineSeparator());
             }
         } catch (Exception ignore) {
-            // 日志失败绝不能影响启动
+            // 日志失败绝不能影响主流程
         }
     }
 }

@@ -22,8 +22,8 @@
 ## 构建
 
 ```bash
-bash build-jar.sh 3.0.9        # 需要 JDK 17+ 与 jsch jar（自动在 ~/.gradle 里找）
-bash package.sh 3.0.9          # 产出 DshClient-<ver>-clean.zip
+bash build-jar.sh 3.2.3        # 需要 JDK 17+ 与 jsch jar（自动在 ~/.gradle 里找）
+bash package.sh 3.2.3          # 产出 DshClient-<ver>-clean.zip
 ```
 
 Windows 端：解压后双击 `run-cef.bat`（用 javaw 后台启动，不留 cmd 窗口）。
@@ -42,6 +42,16 @@ src/dev/example/dshclient/
   term/                 终端（屏幕模型 + 面板 + SSH shell）
   ui/                   v2/v3 视觉（主题、页签条、按钮、弹层、设置面板）
 ```
+
+## 3.2.x 修的三件事
+
+- **3.2.3 终端复制截断**：选区原先按"屏幕坐标"取行（`lineAt(line - lineIndexOfTop())`），
+  一旦滚动过历史就整体偏移、越界行被静默跳过 → 复制出来错位且变短。现在统一用**绝对缓冲区行号**
+  （`TerminalScreen.extractText`），与滚动偏移、与"命令还在输出"都无关。
+- **3.2.2 IPv6 检测不再静默**：启动日志会列出每块网卡的 IPv6 地址；去掉网卡名黑名单、排除 ULA；
+  启动时没有全局 IPv6 则每 15 秒复查（最多 2 分钟），出现后自动从隧道改回直连。
+- **3.2.1 选路偏向直连**：直连判据放宽（10% 丢包 / 800ms 内都算可用）；不再用"下载速度"把直连顶掉
+  （坏的是上传方向，下载快 ≠ 上传能用）；隧道 10 分钟内掉 2 次自动切直连并锁死本次运行。
 
 ## 已知边界
 

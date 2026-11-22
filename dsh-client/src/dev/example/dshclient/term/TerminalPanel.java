@@ -726,33 +726,25 @@ public final class TerminalPanel extends JComponent {
         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
     }
 
+    /**
+     * 取出当前选区的文本。
+     *
+     * <p>3.2.3 修「复制会截断」：以前这里用 {@code lineAt(line - lineIndexOfTop())} 换算，
+     * 而 {@code lineAt} 的入参是**屏幕坐标**、{@code selLine} 存的是**绝对行号**，
+     * 两者只在"没滚动"时碰巧相等。滚过 N 行就会整体偏 N 行，越界的那部分被
+     * {@code l == null → continue} 静默丢掉 —— 表现就是复制出来少了一截、还错位。
+     * 现在直接按绝对行号取，与滚动/新输出无关。
+     */
     String selectedText() {
         if (selAnchorLine < 0 || selLine < 0) {
             return "";
         }
-        int loLine = Math.min(selAnchorLine, selLine);
-        int hiLine = Math.max(selAnchorLine, selLine);
-        int loCol = selAnchorLine <= selLine ? selAnchorCol : selCol;
-        int hiCol = selAnchorLine <= selLine ? selCol : selAnchorCol;
-        int topLine = lineIndexOfTop();
-        StringBuilder sb = new StringBuilder();
-        synchronized (screen) {
-            for (int line = loLine; line <= hiLine; line++) {
-                TerminalScreen.Line l = screen.lineAt(line - topLine);
-                if (l == null) {
-                    continue;
-                }
-                int from = line == loLine ? Math.max(0, loCol) : 0;
-                int to = line == hiLine ? Math.min(l.len, hiCol) : l.len;
-                for (int x = from; x < to; x++) {
-                    sb.append(l.ch[x]);
-                }
-                if (line < hiLine) {
-                    sb.append('\n');
-                }
-            }
+        if (selAnchorLine == selLine && selAnchorCol == selCol) {
+            return "";
         }
-        return sb.toString();
+        synchronized (screen) {
+            return screen.extractText(selAnchorLine, selAnchorCol, selLine, selCol);
+        }
     }
 
     void paste() {

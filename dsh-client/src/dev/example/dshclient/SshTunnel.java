@@ -55,6 +55,8 @@ public final class SshTunnel implements Closeable {
     private String wbForwardError = "";
     /** 这条会话最近一次实测吞吐（KB/s；-1 = 没测过/测不出来）。1.12.0 */
     private double speedKbps = -1;
+    /** 3.2.0：走 WS 隧道时留着这个工厂，用来读"搬了多少字节"和承载层的关闭原因。 */
+    private WsSshSocketFactory wsFactory;
 
     public SshTunnel(String host, int port, String user, String keyPath, int localPort, int remotePort) {
         this(host, port, user, keyPath, localPort, remotePort, 0, 0, null);
@@ -93,12 +95,19 @@ public final class SshTunnel implements Closeable {
         Session s = jsch.getSession(user, host, port);
         s.setConfig("StrictHostKeyChecking", "no");
         s.setConfig("PreferredAuthentications", "publickey");
-        s.setServerAliveInterval(20_000);
+        // 3.1.1：10 秒一次 keepalive、3 次没应答就判定断线（约 30 秒发现，不再干等 60 秒）。
+        // 移动/校园网里 TCP 流被中间设备悄悄回收时，只能靠这个发现。
+        s.setServerAliveInterval(10_000);
         s.setServerAliveCountMax(3);
         // 走隧道（SSH over WebSocket）：不建 TCP，把 SSH 的字节流塞进一条 WebSocket。
         // 用于"直连那条路很烂"时绕开（实测广电移动数据直连 10–35% 丢包）。
         if (wsUrl != null && !wsUrl.isEmpty()) {
-            s.setSocketFactory(new WsSshSocketFactory(wsUrl, 15_000));
+            // 3.2.0：留着这个工厂 —— 转发探活失败时要看"字节还在不在动"，
+            // 断线日志里也要带上 WS 那层的关闭原因（code/reason），否则永远分不清
+            // 是链路被掐、还是客户端自己把会话收掉了。
+            WsSshSocketFactory factory = new WsSshSocketFactory(wsUrl, 15_000);
+            wsFactory = factory;
+            s.setSocketFactory(factory);
         }
         try {
             s.connect(15_000);
@@ -371,9 +380,35 @@ public final class SshTunnel implements Closeable {
         return session != null && session.isConnected();
     }
 
+    /** 服务器标识（SSH-2.0-OpenSSH_x.y）；断开/没连上时返回 "-"。断线日志里用来确认"连的还是不是那台"。 */
+    public synchronized String serverVersion() {
+        try {
+            return session == null ? "-" : String.valueOf(session.getServerVersion());
+        } catch (Throwable t) {
+            return "-";
+        }
+    }
+
     /** 实际绑上的本地端口（用于本地端口填 0 让系统挑一个的场景）。 */
     public synchronized int boundPort() {
         return boundPort;
+    }
+
+    /**
+     * 这条会话已经搬运过多少字节（3.2.0）。
+     *
+     * <p>只有 WS 隧道那条路有计数；直连走的是 JSch 自己的 socket，读不到统计，恒返回 0。
+     * 转发探活用它区分「会话死了」和「会话正忙着传文件，探活只是被挤超时」。
+     */
+    public long transportBytes() {
+        WsSshSocketFactory f = wsFactory;
+        return f == null ? 0 : f.bytesMoved();
+    }
+
+    /** WS 承载层的现场（收/发字节数、关闭 code/reason、发送错误）；直连返回空串。 */
+    public String transportDiagnostics() {
+        WsSshSocketFactory f = wsFactory;
+        return f == null ? "" : f.diagnostics();
     }
 
     /** 副转发实际绑上的本地端口；-1 = 没建起来。 */

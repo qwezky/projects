@@ -184,6 +184,66 @@ public final class TerminalScreen {
         return buf.get(idx);
     }
 
+    /**
+     * 按**绝对缓冲区行号**取行（0 = 最早的一行）。
+     *
+     * <p>为什么需要它：{@link #lineAt(int)} 的入参是"屏幕坐标"（0 = 当前视口第一行），
+     * 滚动一下含义就变了。选区如果拿这个坐标去换算，滚过多少行就错多少行 ——
+     * 表现就是"复制出来的内容少了后半截"。
+     */
+    public Line lineByIndex(int idx) {
+        if (idx < 0 || idx >= buf.size()) {
+            return null;
+        }
+        return buf.get(idx);
+    }
+
+    /** 缓冲区里一共有多少行（含历史）。 */
+    public int bufferSize() {
+        return buf.size();
+    }
+
+    /**
+     * 按绝对行号把一段选区拼成纯文本。
+     *
+     * <p>行号是绝对索引，**与 scrollOffset / 当前视口无关**，所以"选中之后又滚了一下、
+     * 或者命令还在继续输出"都不会改变复制结果。
+     *
+     * @param loLine 起点绝对行号（含）
+     * @param loCol  起点列（含；0 = 行首）
+     * @param hiLine 终点绝对行号（含）
+     * @param hiCol  终点列（不含；行尾取很大的数也行）
+     */
+    public synchronized String extractText(int loLine, int loCol, int hiLine, int hiCol) {
+        int a = Math.min(loLine, hiLine);
+        int b = Math.max(loLine, hiLine);
+        int fromCol = loLine <= hiLine ? loCol : hiCol;
+        int toCol = loLine <= hiLine ? hiCol : loCol;
+        StringBuilder sb = new StringBuilder();
+        for (int line = a; line <= b; line++) {
+            Line l = lineByIndex(line);
+            if (l != null) {
+                // 起始列只作用于**第一行**；中间行必须从行首开始，否则每行都会被削掉前几列
+                int from = line == a ? Math.max(0, Math.min(l.len, fromCol)) : 0;
+                int to = line == b ? Math.max(from, Math.min(l.len, toCol)) : l.len;
+                for (int x = from; x < to; x++) {
+                    char c = l.ch[x];
+                    sb.append(c == '\0' ? ' ' : c);
+                }
+                // 行尾多余的空格（终端缓冲里补的）去掉，只留真实内容
+                int end = sb.length();
+                while (end > 0 && sb.charAt(end - 1) == ' ') {
+                    end--;
+                }
+                sb.setLength(end);
+            }
+            if (line < b) {
+                sb.append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
     /** 回看时把光标藏起来（历史区不画光标）。 */
     boolean cursorVisible(int scrollOffset) {
         return scrollOffset == 0;

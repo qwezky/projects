@@ -81,7 +81,55 @@ final class ClientFrame extends JFrame {
     private final JLabel wbStateLabel = new JLabel("WorkBuddy 容器：未知");
 
     private final JLabel status = new JLabel("未连接");
-    private final JTextArea log = new JTextArea(8, 64);
+    /**
+     * 「日志」页签的文本框。
+     *
+     * <p>为什么是匿名子类：Swing 在**右键按下**时会把插入点挪到鼠标处、顺手清掉选区，
+     * 等我们的 MouseListener 收到事件时已经没东西可复制了（用户实测"右键点不动、Ctrl+C 也没反应"）。
+     * 这里在 super 处理之前把选区记下来，右键菜单里的「复制」才有内容可用。
+     */
+    private final JTextArea log = new JTextArea(8, 64) {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void processMouseEvent(java.awt.event.MouseEvent e) {
+            if (e.isPopupTrigger()) {
+                rememberLogSelection();
+            }
+            super.processMouseEvent(e);
+        }
+    };
+    /** 日志页签的滚动容器：只在"本来就贴在底部"时跟随新行，用户翻上去看历史时不被拽回来。 */
+    private JScrollPane logScroll;
+    /** 右键/复制用的选区兜底（右键清掉选区后仍能复制刚才选的那段）。 */
+    private String logSelBuffer = "";
+    private int logSelStart = -1;
+    private int logSelEnd = -1;
+
+    /** 重连防抖：同一时刻只允许一条重连线程；失败按 2→4→8→16→30 秒退避。 */
+    private final java.util.concurrent.atomic.AtomicBoolean reconnecting =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile long reconnectNotBefore = 0L;
+    private int reconnectTries;
+    private boolean tunnelWasAlive;
+    /** 转发探活：SSH 会话"看着还连着"但转发已经没数据时，靠它发现（见 startForwardProbe）。 */
+    private java.util.Timer forwardProbe;
+    private volatile int probeFails;
+    /** WorkBuddy 的 6080 被 permitopen 拒：完整修法只打一次，别每次重连都刷一遍。 */
+    private boolean wbPermitNoteShown;
+    /** 10 分钟窗口内的掉线次数 / 窗口起点（钉死路线时用来提示换路）。 */
+    private long dropWindowStart;
+    private int dropsInWindow;
+    /**
+     * 本次运行里隧道已经"烧掉"了（3.2.1）。
+     *
+     * <p>隧道掉过 2 次就说明这条承载层不稳（大文件上传必断），自动切到直连后**不要再因为
+     * 直连掉线就切回隧道** —— 否则两条路各掉两次，就在 DIRECT / TUNNEL 之间来回跳。
+     * 直连真连不上时仍会走 connect() 的失败回落（那次是"连不上"，不是"掉线"）。
+     */
+    private boolean tunnelBurned;
+    /** 3.2.2：启动时没拿到全局 IPv6 的复查定时器（见 startIpv6Watch）。 */
+    private javax.swing.Timer ipv6Watch;
 
     // ---------------- 2.10.0：内置 SSH 终端 + 暗/亮主题 ----------------
     /** 终端控件（自绘字格，见 term 包）。 */
@@ -269,7 +317,18 @@ final class ClientFrame extends JFrame {
             logLine("字体：界面=" + UiFonts.UI_FAMILY + "｜等宽=" + UiFonts.MONO_FAMILY
                     + "｜汉字=" + UiFonts.CJK_FAMILY + "（出现方块就是这三个都没汉字）");
             if (!cfg.resolveNote.isEmpty()) logLine(cfg.resolveNote);
+            // 3.2.2：把"这台机器看到哪些 IPv6"直接写进日志。
+            // 以前只有一句"本机没有任何全局 IPv6 地址"，既不说是哪块网卡、也不说枚举是否成功，
+            // 结果明明是 Windows 有公网 IPv6 却判成没有，谁也没法查。
+            String[] v6 = RouteProbe.findGlobalIpv6();
+            logLine("本机 IPv6：" + (v6 == null ? "无全局地址" : v6[0] + " → " + v6[1])
+                    + "　［全部：" + RouteProbe.ipv6Inventory() + "］");
+            if (v6 == null) startIpv6Watch();
             if (!DshClient.routeReason.isEmpty()) logLine(DshClient.routeReason);
+            if (!routeAuto) {
+                logLine("　※ 路线是按设置**钉死**的（只有「自动」才会在连不上时回落）。"
+                        + "如果这条 IPv6 直连一直抖，把设置里的「路线」改成「自动（判读 + 实测）」或「域名（CF 隧道）」再试。");
+            }
             logLine("本次连接目标：" + cfg.hostResolved + ":" + cfg.port
                     + "｜token：" + (cfg.tokenResolved == null || cfg.tokenResolved.isEmpty()
                     ? "(空)" : cfg.tokenResolved.substring(0, Math.min(6, cfg.tokenResolved.length())) + "…"));
@@ -950,9 +1009,119 @@ final class ClientFrame extends JFrame {
     private JPanel logPanel() {
         log.setEditable(false);
         log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        log.setFocusable(true);
+        log.setMargin(new java.awt.Insets(6, 8, 6, 8));
+        // 不可编辑的 JTextArea 默认没有右键菜单；Ctrl+Shift+C 也不认（那是终端页签的手势）。
+        // 这里两样都补上，让"选中 → 右键/Ctrl+C/Ctrl+Shift+C"三条路都能复制。
+        bindLogCopyKeys();
+        logScroll = new JScrollPane(log);
+        logScroll.setBorder(BorderFactory.createEmptyBorder());
+        installLogPopup();
         JPanel p = new JPanel(new BorderLayout());
-        p.add(new JScrollPane(log), BorderLayout.CENTER);
+        p.add(logScroll, BorderLayout.CENTER);
         return p;
+    }
+
+    /** Ctrl+C / Ctrl+Shift+C / Ctrl+Shift+A：日志页签里也认这几个手势。 */
+    private void bindLogCopyKeys() {
+        int ctrl = java.awt.event.InputEvent.CTRL_DOWN_MASK;
+        int shift = java.awt.event.InputEvent.SHIFT_DOWN_MASK;
+        javax.swing.Action copyAction = new javax.swing.AbstractAction("复制日志") {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                copyLogSelection();
+            }
+        };
+        log.getActionMap().put("dsh-log-copy", copyAction);
+        log.getInputMap().put(javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_C, ctrl), "dsh-log-copy");
+        log.getInputMap().put(javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_C, ctrl | shift), "dsh-log-copy");
+        log.getActionMap().put("dsh-log-selectall", new javax.swing.AbstractAction("全选") {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                log.selectAll();
+            }
+        });
+        log.getInputMap().put(javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_A, ctrl | shift), "dsh-log-selectall");
+    }
+
+    /** 日志页签右键菜单：复制 / 全选 / 清空。 */
+    private void installLogPopup() {
+        javax.swing.JPopupMenu menu = new javax.swing.JPopupMenu();
+        javax.swing.JMenuItem copy = new javax.swing.JMenuItem("复制");
+        copy.addActionListener(e -> copyLogSelection());
+        javax.swing.JMenuItem selectAll = new javax.swing.JMenuItem("全选");
+        selectAll.addActionListener(e -> log.selectAll());
+        javax.swing.JMenuItem clear = new javax.swing.JMenuItem("清空");
+        clear.addActionListener(e -> {
+            log.setText("");
+            logSelBuffer = "";
+            logSelStart = -1;
+            logSelEnd = -1;
+        });
+        menu.add(copy);
+        menu.add(selectAll);
+        menu.addSeparator();
+        menu.add(clear);
+
+        log.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override
+            public void mousePressed(java.awt.event.MouseEvent e) {
+                maybeShow(e);
+            }
+
+            @Override
+            public void mouseReleased(java.awt.event.MouseEvent e) {
+                maybeShow(e);
+            }
+
+            private void maybeShow(java.awt.event.MouseEvent e) {
+                if (!e.isPopupTrigger()) {
+                    return;
+                }
+                log.requestFocusInWindow();
+                if (log.getSelectedText() == null || log.getSelectedText().isEmpty()) {
+                    restoreLogSelection();     // 右键清掉选区时还原，用户看得见要复制什么
+                }
+                menu.show(e.getComponent(), e.getX(), e.getY());
+            }
+        });
+    }
+
+    /** 复制当前选区；选区被右键/刷新清掉时退回"刚才记下的那段"。 */
+    private void copyLogSelection() {
+        String text = log.getSelectedText();
+        if (text == null || text.isEmpty()) {
+            text = logSelBuffer;
+        }
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        try {
+            java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(new java.awt.datatransfer.StringSelection(text), null);
+        } catch (Exception ignore) {
+            // 剪贴板被别的程序占着时忽略
+        }
+    }
+
+    private void rememberLogSelection() {
+        String text = log.getSelectedText();
+        if (text != null && !text.isEmpty()) {
+            logSelBuffer = text;
+            logSelStart = log.getSelectionStart();
+            logSelEnd = log.getSelectionEnd();
+        }
+    }
+
+    private void restoreLogSelection() {
+        int len = log.getDocument().getLength();
+        if (logSelStart >= 0 && logSelEnd > logSelStart && logSelEnd <= len) {
+            log.select(logSelStart, logSelEnd);
+        }
     }
 
     // ---------------- 界面手动选路（1.26.0） ----------------
@@ -1053,8 +1222,14 @@ final class ClientFrame extends JFrame {
         return x;
     }
 
-    /** 连隧道（幂等：已连就直接返回 true）。web 路线不建 SSH，直接算成功。 */
-    private boolean connect() {
+    /**
+     * 连隧道（幂等：已连就直接返回 true）。web 路线不建 SSH，直接算成功。
+     *
+     * <p>3.1.0 起是 synchronized：看门狗、"重新连接"按钮、界面切换路线可能同时进来，
+     * 以前两条并发连接都去 bind 同一个 3080，后到的那条必然失败，却被当成"这条路线不行"，
+     * 于是自动回落去切路线 —— 表现出来就是"时断时续"。
+     */
+    private synchronized boolean connect() {
         try {
             if (route == RouteProbe.Route.WEB) {
                 setStatus("网页隧道（不经 SSH）· " + DshClient.webUrl(cfg), false);
@@ -1087,14 +1262,26 @@ final class ClientFrame extends JFrame {
                 t = makeTunnel(route);
             }
             tunnel = t;
+            tunnelWasAlive = true;
+            reconnectTries = 0;
+            reconnectNotBefore = 0;
             connectedAt = System.currentTimeMillis();
             setStatus("已连接 · " + t.url(null), false);   // refreshStatus 会把路线与实测速度拼上
             logLine("SSH 转发就绪（DSH 界面）→ " + t.url(null)
                     + "　※ 这条是「端口转发」：任何路线（直连/域名）都靠它把服务器上的 loopback 端口搬到本机");
             if (DshClient.wbEnabled(cfg)) {
                 if (t.boundWbPort() > 0) {
+                    String sc = t.lastWbSelfCheck();
+                    boolean wbOk = sc != null && sc.startsWith("HTTP/");
                     logLine("WorkBuddy 的 SSH 转发就绪（③ 兜底）→ http://127.0.0.1:" + t.boundWbPort()
-                            + "/（自检：" + t.lastWbSelfCheck() + "）");
+                            + "/" + (wbOk ? "（自检：" + sc + "）" : "（自检没过）"));
+                    if (!wbOk && !wbPermitNoteShown) {
+                        wbPermitNoteShown = true;
+                        logLine("　⚠️ " + String.valueOf(sc).replace('\n', ' '));
+                        logLine("　※ 服务器那把 key 的 permitopen 只放了 3080。一次性修法（服务器上改 authorized_keys 那一行）："
+                                + "permitopen=\"127.0.0.1:3080\",permitopen=\"127.0.0.1:6080\"（不用重启 sshd）。"
+                                + "DSH 的 3080 转发不受影响，这条只是 WorkBuddy 走 SSH 转发时会用到。");
+                    }
                     logLine("　※ 它只是备好了；点「打开 WorkBuddy 桌面」时按 " + wbOrderText() + " 各实测一次，挑最快的");
                 } else if (!t.wbForwardError().isEmpty()) {
                     logLine("⚠️ " + t.wbForwardError());
@@ -1333,42 +1520,234 @@ final class ClientFrame extends JFrame {
         refreshWbState();
     }
 
-    /** 看门狗：每 5 秒看一眼会话，断了自动重连（页面按 F5 即可）。 */
+    /**
+     * 看门狗：每 3 秒看一眼会话，断了自动重连。
+     *
+     * <p>3.1.0 修「连接时断时续、一直在重连」的两个自伤点：
+     * <ul>
+     *   <li><b>并发重连</b>：以前每 3 秒只要看到 tunnel 死了就再起一条线程，而 connect() 要 15 秒才超时，
+     *       于是同一时刻可能有好几条在连同一条 3080 —— 后连的必然 "本地端口建立转发失败"，
+     *       失败又触发路线回落（direct→tunnel→web），看起来就是"一直在断、一直在切"。
+     *       现在整个重连是单飞的，connect() 也加了同步。</li>
+     *   <li><b>失败无退避</b>：连不上就每 3 秒重试一遍，日志刷屏、把服务器也一起打。
+     *       现在 2→4→8→16→30 秒退避，连上后清零。</li>
+     * </ul>
+     */
     private void startWatchdog() {
         if (watchdog != null) return;
         watchdog = new javax.swing.Timer(3_000, e -> {
-            if (stopped || tunnel == null) return;
-            if (!tunnel.isAlive()) {
-                // 连稳 5 分钟以上才把"掉线计数"清零 —— 否则偶发一次就白记
-                long aliveMs = connectedAt > 0 ? System.currentTimeMillis() - connectedAt : -1;
-                if (aliveMs > 300_000) directDrops = 0;
-                if (routeAuto && route == RouteProbe.Route.DIRECT) {
-                    directDrops++;
-                    logLine("SSH 直连断了（本次运行第 " + directDrops + " 次"
-                            + (aliveMs >= 0 ? "，这次只撑了 " + (aliveMs / 1000) + " 秒" : "") + "）");
-                    // 1.14.0：刚连上就断 = 这条路明显不行，**第一次就切**，不用等第二次
-                    if (directDrops >= 2 || (aliveMs >= 0 && aliveMs < 60_000)) {
-                        setRoute(RouteProbe.Route.TUNNEL,
-                                aliveMs >= 0 && aliveMs < 60_000 ? "直连只撑了 " + (aliveMs / 1000) + " 秒"
-                                        : "直连掉了 " + directDrops + " 次线");
-                    }
-                } else {
-                    logLine("隧道断了，正在自动重连…");
-                }
-                new Thread(() -> {
-                    if (connect()) {
-                        logLine("✅ 已重连。浏览器里的页面按 F5 刷新一下就好（本地端口没变）。");
-                        refreshWbState();
-                    }
-                }, "dsh-rewatch").start();
+            // 网页隧道路线没有 SSH 会话可守（以前这里会一直刷"已重连"）
+            if (stopped || tunnel == null || route == RouteProbe.Route.WEB) return;
+            if (tunnel.isAlive()) {
+                tunnelWasAlive = true;
+                return;
             }
+            if (!reconnecting.compareAndSet(false, true)) {
+                return;                      // 已经有一条重连线程在跑（含退避等待）
+            }
+            boolean justLost = tunnelWasAlive;
+            tunnelWasAlive = false;
+            if (justLost) {
+                onTunnelLost();
+            }
+            startReconnectThread();
         });
         watchdog.start();
+        startForwardProbe();
+    }
+
+    /**
+     * 3.2.2：启动那一刻没有全局 IPv6 时，隔 15 秒复查一次，最多 2 分钟。
+     *
+     * <p>为什么需要：Windows 刚连上 Wi-Fi 时，IPv6 地址往往比 IPv4 晚几秒到几十秒才出现。
+     * 客户端只在启动瞬间判一次，就会一直把路线钉在隧道上 —— 而隧道传大文件会断。
+     * 这里等它出现，出现了就把自动路线改回直连。
+     */
+    private void startIpv6Watch() {
+        if (ipv6Watch != null) return;
+        final int[] ticks = {0};
+        ipv6Watch = new javax.swing.Timer(15_000, e -> {
+            ticks[0]++;
+            String[] v6 = RouteProbe.findGlobalIpv6();
+            if (v6 != null) {
+                ((javax.swing.Timer) e.getSource()).stop();
+                logLine("★ 本机出现了全局 IPv6：" + v6[0] + " → " + v6[1]);
+                if (routeAuto && route == RouteProbe.Route.TUNNEL) {
+                    setRoute(RouteProbe.Route.DIRECT, "本机后来拿到了全局 IPv6，改走直连（隧道传大文件会断）");
+                }
+                return;
+            }
+            if (ticks[0] >= 8) {
+                ((javax.swing.Timer) e.getSource()).stop();
+                logLine("本机始终没有全局 IPv6（已复查 2 分钟）。要去直连得先让 Windows 拿到 IPv6："
+                        + "看 设置 → 网络 → WLAN → IPv6 是否有公网 IPv6 地址。");
+            }
+        });
+        ipv6Watch.start();
+    }
+
+    /** 刚发现掉线时打一次日志/计数/切路线；重试期间不再重复。 */
+    private void onTunnelLost() {
+        long aliveMs = connectedAt > 0 ? System.currentTimeMillis() - connectedAt : -1;
+        // 10 分钟窗口内的掉线次数：钉死路线时给一句"该换路了"，别让人对着刷屏的日志发呆
+        long now = System.currentTimeMillis();
+        if (now - dropWindowStart > 600_000L) {
+            dropWindowStart = now;
+            dropsInWindow = 0;
+        }
+        dropsInWindow++;
+        if (!routeAuto && dropsInWindow == 3) {
+            logLine("⚠️ 这条钉死的路线 10 分钟内已经断了 3 次（" + routeTitle(route)
+                    + "）。建议改成「自动」让它自己回落，或在设置里换一条。");
+        }
+        // 连稳 5 分钟以上才把"掉线计数"清零 —— 否则偶发一次就白记
+        if (aliveMs > 300_000) directDrops = 0;
+        if (routeAuto && route == RouteProbe.Route.DIRECT) {
+            directDrops++;
+            logLine("SSH 直连断了（本次运行第 " + directDrops + " 次"
+                    + (aliveMs >= 0 ? "，这次只撑了 " + (aliveMs / 1000) + " 秒" : "") + "）");
+            // 1.14.0：刚连上就断 = 这条路明显不行，**第一次就切**，不用等第二次
+            // 3.2.1：但隧道已经"烧掉"（见 tunnelBurned）时不再切回去，否则两条路互相顶，来回跳。
+            if (!tunnelBurned && (directDrops >= 2 || (aliveMs >= 0 && aliveMs < 60_000))) {
+                setRoute(RouteProbe.Route.TUNNEL,
+                        aliveMs >= 0 && aliveMs < 60_000 ? "直连只撑了 " + (aliveMs / 1000) + " 秒"
+                                : "直连掉了 " + directDrops + " 次线");
+            }
+        } else {
+            logLine("隧道断了，正在自动重连…");
+            // 3.2.1：隧道（SSH over WebSocket）连着掉 = 这条路的承载层不稳（大文件上传实测必断）。
+            // 本机有全局 IPv6 时改走直连：直连是纯 TCP，传多大的文件都不会被"帧突发"弄断。
+            if (routeAuto && route == RouteProbe.Route.TUNNEL && dropsInWindow >= 2
+                    && RouteProbe.hasGlobalIpv6()) {
+                tunnelBurned = true;
+                setRoute(RouteProbe.Route.DIRECT,
+                        "隧道 10 分钟内掉了 " + dropsInWindow + " 次，改走 IPv6 直连（本次运行不再切回隧道）");
+            }
+        }
+        // 3.1.1：把"断的时候是什么状态"记下来 —— 只看"断了"没法判断是对端 reset、keepalive 超时，
+        // 还是本地转发被回收。真正的底层原因在 ~/.dsh-client.log 的 [jsch] 行里。
+        if (tunnel != null) {
+            logLine("　※ 会话诊断：server=" + tunnel.serverVersion()
+                    + "，本地端口=" + (tunnel.boundPort() > 0 ? tunnel.boundPort() : -1)
+                    + "，上次连上后撑了 " + (aliveMs >= 0 ? (aliveMs / 1000) + " 秒" : "未知"));
+            // 3.2.0：WS 那一层到底发生了什么（收/发字节、关闭 code/reason、发送错误）。
+            // 断线到底是"链路把 WS 关了"还是"我们自己掐的"，这一行能直接看出来。
+            String td = tunnel.transportDiagnostics();
+            if (td != null && !td.isEmpty()) {
+                logLine("　※ 承载层（WS）：" + td);
+            }
+        }
+    }
+
+    /**
+     * 转发探活：每 5 秒从本机端口发一条最小 HTTP 请求。
+     *
+     * <p>为什么需要：JSch 的 {@code isConnected()} 只反映 TCP/SSH 层；中间设备把这条流"静默回收"时，
+     * 它可能还报"连着"，而页面其实一个字节都收不到 —— 表现就是"没断但打不开"。
+     *
+     * <p><b>3.2.0 修的自伤点</b>：上传大文件时整条隧道都在搬字节，探活请求排在后面超时是正常的；
+     * 老逻辑连续 6 次（约 30 秒）就 {@code t.close()}，等于"用户一传图，客户端自己把好会话掐了"。
+     * 现在多了两道闸：
+     * <ul>
+     *   <li>失败时先看 {@link SshTunnel#transportBytes()}：字节还在涨 = 会话活着，这次失败不算数；</li>
+     *   <li>真要判死，阈值从 6 次放宽到 12 次（约 60 秒），且探活请求本身也是被挤的那个，本来就不该太灵。</li>
+     * </ul>
+     */
+    private void startForwardProbe() {
+        if (forwardProbe != null) return;
+        forwardProbe = new java.util.Timer("dsh-forward-probe", true);
+        forwardProbe.scheduleAtFixedRate(new java.util.TimerTask() {
+            @Override
+            public void run() {
+                SshTunnel t = tunnel;
+                if (stopped || t == null || route == RouteProbe.Route.WEB || !t.isAlive()) {
+                    probeFails = 0;
+                    return;
+                }
+                int p = t.boundPort() > 0 ? t.boundPort() : cfg.localPort;
+                long bytesBefore = t.transportBytes();
+                try {
+                    SshTunnel.httpProbe("127.0.0.1", p, "/", 1_500, 4_000, "转发探活");
+                    if (probeFails >= 3) {
+                        logLine("转发探活恢复正常");
+                    }
+                    probeFails = 0;
+                } catch (Exception e) {
+                    // 3.2.0：字节还在涨 = 正在传文件，探活超时是被挤的，不是会话死了 —— 不计数。
+                    //
+                    // 为什么用 4KB 阈值而不是"有变化"：探活请求自己也会往隧道里写一百多个字节，
+                    // 用"有变化"的话，哪怕 WS 已经死了、只是本地把字节收进了发送缓冲，也一样算"在动"，
+                    // 结果就是永远判不出死会话（老的"没断但打不开"又回来了）。
+                    // 真在传文件时一帧就是 16KB，拿 4KB 当门槛两边都能分开。
+                    if (t.transportBytes() - bytesBefore > 4 * 1024) {
+                        if (probeFails > 0) probeFails = 0;
+                        return;
+                    }
+                    probeFails++;
+                    if (probeFails == 3) {
+                        logLine("⚠️ 转发连续 3 次探活失败（SSH 会话还连着，但本地端口没数据）："
+                                + String.valueOf(e.getMessage()).replace('\n', ' '));
+                    } else if (probeFails >= 12 && probeFails % 3 == 0) {
+                        logLine("转发连续 " + probeFails + " 次失败、隧道里也没有字节在动（约 "
+                                + (probeFails * 5) + " 秒）→ 主动断开这条会话，让看门狗重连");
+                        t.close();
+                    }
+                }
+            }
+        }, 5_000, 5_000);
+    }
+
+    /** 起一条重连线程（调用方已用 reconnecting 占位）。失败时退避，成功后刷新内嵌页面。 */
+    private void startReconnectThread() {
+        new Thread(() -> {
+            try {
+                long wait = reconnectNotBefore - System.currentTimeMillis();
+                if (wait > 0) {
+                    Thread.sleep(wait);
+                }
+                if (stopped) {
+                    return;
+                }
+                if (connect()) {
+                    reconnectTries = 0;
+                    reconnectNotBefore = 0;
+                    tunnelWasAlive = true;
+                    logLine("✅ 已重连（本地端口没变，页面会自动刷新）。");
+                    refreshWbState();
+                    reloadEmbeddedPage();
+                } else {
+                    reconnectTries++;
+                    long backoff = Math.min(30_000L, 2_000L * (1L << Math.min(reconnectTries - 1, 4)));
+                    reconnectNotBefore = System.currentTimeMillis() + backoff;
+                    logLine("重连失败（第 " + reconnectTries + " 次），" + (backoff / 1000) + " 秒后再试");
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } finally {
+                reconnecting.set(false);
+            }
+        }, "dsh-rewatch").start();
+    }
+
+    /** 自动重连成功后把内嵌页面刷一下 —— 否则要用户自己按 F5，看着像"客户端又挂了"。 */
+    private void reloadEmbeddedPage() {
+        if (embedDsh == null || centerTabs == null || centerTabs.indexOf(embedDsh) < 0) {
+            return;
+        }
+        SwingUtilities.invokeLater(() -> {
+            try {
+                embedDsh.reload();
+                logLine("内嵌页面已自动刷新（token 没变，不用按 F5）");
+            } catch (Exception ignore) {
+                // 浏览器已释放时忽略
+            }
+        });
     }
 
     private void stop() {
         stopped = true;
         if (watchdog != null) watchdog.stop();
+        if (forwardProbe != null) forwardProbe.cancel();
         if (tunnel != null) tunnel.close();
         if (wbOnlyTunnel != null) wbOnlyTunnel.close();
         setStatus("已断开", false);
@@ -1883,11 +2262,36 @@ final class ClientFrame extends JFrame {
         refreshStatus();
     }
 
+    /**
+     * 往「日志」页签追加一行。
+     *
+     * <p>3.1.0 修"日志页签复制不了"：以前每来一行都 setCaretPosition(末尾)，
+     * 而 Swing 的 setCaretPosition 会**把选区一起清掉** —— 你刚选中一段，下一行日志（看门狗每 3 秒就有一条）
+     * 就把它抹了，Ctrl+C 自然复制不到东西。现在只在"没选中任何文字、并且本来就贴在底部"时才跟随滚动。
+     *
+     * <p>同时落一份到 {@code ~/.dsh-client.log}（带时间戳），"波动/掉线"时把那个文件发出来就能定位。
+     */
     private void logLine(String text) {
+        Startup.runtime(text);
         SwingUtilities.invokeLater(() -> {
+            if (logScroll == null) {
+                log.append(text + "\n");
+                log.setCaretPosition(log.getDocument().getLength());
+                return;
+            }
+            boolean noSelection = log.getSelectionStart() == log.getSelectionEnd();
+            boolean follow = noSelection && logAtBottom();
             log.append(text + "\n");
-            log.setCaretPosition(log.getDocument().getLength());
+            if (follow) {
+                log.setCaretPosition(log.getDocument().getLength());
+            }
         });
+    }
+
+    /** 视图是不是贴在底部（用户往上翻看历史时不抢滚动位置）。 */
+    private boolean logAtBottom() {
+        javax.swing.JScrollBar sb = logScroll.getVerticalScrollBar();
+        return sb.getValue() + sb.getVisibleAmount() >= sb.getMaximum() - 8;
     }
 
     /**
