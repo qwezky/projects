@@ -64,6 +64,19 @@ src/dev/example/dshclient/
 - 服务器侧若用 `no-pty` / `command="internal-sftp"` 限制 key，终端拿不到 shell；
   `SshShell` 会明确报出这个原因。
 
+## 仓库位置
+
+| 项 | 值 |
+|---|---|
+| 仓库 | `qwezky/projects` — <https://github.com/qwezky/projects> |
+| 目录 | `dsh-client/`（本项目没有独立仓库） |
+| 克隆 | `git clone git@github.com:qwezky/projects.git && cd projects/dsh-client` |
+| 版本 tag | `v3.2.4`（当前） · `v3.2.3` · `v3.0.9` |
+| 构建 | `JAVA_HOME=<JDK17> bash build-jar.sh 3.2.4`（`cef/` 里按脚本注释放 7 个 jar） |
+
+源码按脱敏约定发布：包名 `dev.example.dshclient`，默认主机/域名/token 均为占位值，
+不包含本机的真实 IPv6、域名与凭据。
+
 ## 许可
 
 PolyForm Noncommercial 1.0.0（见仓库根 LICENSE）。

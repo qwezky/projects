@@ -3,6 +3,9 @@
 这里是我做过的一些项目，保留了代码、结构、设计取舍与实测结论。示例地址使用
 `example.com` / `2001:db8::/32` 这类文档专用值，直接照抄跑不起来，需要换成自己的环境。
 
+仓库：`git@github.com:qwezky/projects.git`（<https://github.com/qwezky/projects>）。
+各项目没有独立仓库，都是本仓库下的一个目录；版本以 tag 标注（例如 `dsh-client` 的 `v3.2.4`）。
+
 每个目录都能单独读：先看该目录的 `README.md`。
 
 ## 项目
