@@ -176,6 +176,16 @@ final class ClientFrame extends JFrame {
     private boolean darkMode = true;
     /** 主题中枢（WB 专家产出的 ui 包）：颜色令牌 + 切换广播 + 持久化桥。 */
     private final ThemeManager tm = ThemeManager.get();
+    /** 顶部那颗主题按钮；外部（系统切换/设置下拉）改模式时也要跟着改文字。 */
+    private ModernButton themeBtn;
+    /** 跟随系统的复查定时器（每 3 秒问一次系统，变了就走过渡）。 */
+    private javax.swing.Timer themeWatch;
+    /** 后台探测是否还在跑（避免上一个 reg 还没回来又起一个）。 */
+    private boolean themeProbeRunning;
+    /** 已经推给内嵌 DSH 页面的亮暗；过渡动画每帧都会走 applyTheme，值没变就不重复推。 */
+    private Boolean pushedPageDark;
+    /** 主题模式表：下标与设置里的下拉一一对应，也是顶部按钮的循环顺序。 */
+    private static final String[] THEME_MODES = {"system", "light", "dark"};
     /** 顶部那颗状态徽标（连接中·已连接·已断开·错误）。 */
     private final StatusPill pill;
     /** 需要跟着主题换底色的普通控件（递归刷一遍，简单可靠）。 */
@@ -225,6 +235,17 @@ final class ClientFrame extends JFrame {
                         "② 域名 wb.example.com", "③ SSH 转发 127.0.0.1:6080"}, tm);
         themeCombo = new dev.example.dshclient.ui.ChoiceField(
                 new String[]{"跟随系统", "亮色", "暗色"}, tm);
+        // 3.2.4：这个下拉之前没有监听器（改了下拉毫无反应）。顺序与 THEME_MODES 对齐。
+        themeCombo.addSelectionListener(v -> {
+            if (syncingThemeCombo) {
+                return;
+            }
+            int index = themeCombo.selectedIndex();
+            if (index >= 0 && index < THEME_MODES.length) {
+                tm.setMode(THEME_MODES[index]);
+                syncThemeControls();
+            }
+        });
 
         routeBox.setSelectedIndex(routeIndexOf(cfg.route));
         wbRouteBox.setSelectedIndex(wbRouteIndexOf(cfg.wbRoute));
@@ -263,7 +284,15 @@ final class ClientFrame extends JFrame {
             logLine("内嵌浏览器：开 → DSH / WorkBuddy 进客户端页签");
         }
 
-        // 主题：先把持久化接上（写回 properties），再按配置/系统判断定一版，最后挂监听统一重绘
+        // 主题：系统探测 → 持久化 → 按"模式"定色 → 监听统一重绘。
+        //
+        // 3.2.4 之前的三个坑（"跟随系统"永远是深色、也切不动）：
+        //   1. 这里把 system 先折成 dark/light 再 setMode，而 setMode 会把参数写回配置
+        //      → 首次启动后配置就变成固定色，"跟随系统"永久丢失；
+        //   2. ThemeManager 的 detectSystemDark 看的是 Swing 默认控件底色（Windows 上恒为浅色），
+        //      从来没读过系统的深色开关；
+        //   3. 全程只算一次，系统切换深色不会重算，也没有任何定时复查。
+        tm.setSystemDarkSource(this::systemDark);
         tm.setPersistence(new ThemeManager.Persistence() {
             @Override
             public java.util.function.Consumer<String> persist() {
@@ -279,8 +308,12 @@ final class ClientFrame extends JFrame {
             }
         });
         String want = cfg.theme == null ? "system" : cfg.theme.trim().toLowerCase();
-        boolean wantDark = "dark".equals(want) || ("system".equals(want) && resolveThemeDark());
-        tm.setMode(wantDark ? "dark" : "light");
+        try {
+            tm.setMode(want);
+        } catch (IllegalArgumentException legacy) {
+            // 旧版本可能把垃圾值写进了配置
+            tm.setMode("system");
+        }
         tm.addListener(this::applyTheme);
 
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -304,6 +337,7 @@ final class ClientFrame extends JFrame {
         setSize(1000, 660);
         setLocationRelativeTo(null);
         applyTheme();
+        startThemeWatch();
         terminal.printLocal("DSH 客户端 " + DshClient.VERSION + " · 内置 SSH 终端\n"
                 + "点上方「连接终端」开一条 shell —— 用的是同一个账号、同一把 key，和端口转发互不影响。\n"
                 + "（Ctrl+Shift+C 复制，Ctrl+Shift+V 粘贴，Ctrl+滚轮 或 A+/A- 改字号）\n\n");
@@ -388,14 +422,11 @@ final class ClientFrame extends JFrame {
         dlBtn.addActionListener(e -> showDownloadMenu(dlBtn));
         actions.add(dlBtn);
 
-        ModernButton themeBtn = new ModernButton(themeLabel(), ModernButton.Kind.GHOST, tm);
-        themeBtn.addActionListener(e -> {
-            UiTheme from = tm.theme();
-            tm.setMode(tm.isDarkEffective() ? "light" : "dark");
-            UiTheme to = tm.theme();
-            themeBtn.setText(themeLabel());
-            themeTransition.play(from, to, this::applyThemeOf);
-        });
+        // 3.2.4：点一下走一格（跟随系统 → 亮色 → 暗色），颜色过渡由 ThemeManager 自己播；
+        // 以前这里只会在亮/暗之间翻，而且永远回不到"跟随系统"。
+        themeBtn = new ModernButton(themeLabel(), ModernButton.Kind.GHOST, tm);
+        themeBtn.setToolTipText("点一下切换主题：跟随系统 → 亮色 → 暗色");
+        themeBtn.addActionListener(e -> cycleThemeMode());
         ModernButton settingsBtn = new ModernButton("设置", ModernButton.Kind.GHOST, tm);
         settingsBtn.addActionListener(e -> showSettings());
         actions.add(themeBtn);
@@ -462,10 +493,6 @@ final class ClientFrame extends JFrame {
                 return new Dimension(10, 2);
             }
         };
-    }
-
-    private String themeLabel() {
-        return tm.isDarkEffective() ? "切到亮色" : "切到暗色";
     }
 
     /**
@@ -794,31 +821,156 @@ final class ClientFrame extends JFrame {
 
     // ================= 主题 =================
 
-    private boolean resolveThemeDark() {
-        String t = cfg.theme == null ? "system" : cfg.theme.trim().toLowerCase();
-        if ("light".equals(t)) return false;
-        if ("dark".equals(t)) return true;
-        // 跟随系统：Windows 上读注册表的深色开关；读不到就按暗色（客户端本来就是深色界面）
+    /**
+     * 系统当前是不是深色（"跟随系统"的唯一依据）。
+     *
+     * Windows：读 HKCU\...\Themes\Personalize\AppsUseLightTheme（0x0 = 深色）。
+     * 其它系统：允许 -Ddsh.theme.systemDark=true/false 覆盖，便于在 Linux 上回归；
+     * 都没就按亮色处理（宁可亮，也不要"读不到就锁死深色"——那正是 3.2.4 之前的症状）。
+     */
+    private boolean systemDark() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("win")) {
+            Boolean fromRegistry = windowsAppsUseDarkTheme();
+            if (fromRegistry != null) {
+                return fromRegistry;
+            }
+        }
+        String override = System.getProperty("dsh.theme.systemDark");
+        if (override != null && !override.isBlank()) {
+            return Boolean.parseBoolean(override.trim());
+        }
+        return false;
+    }
+
+    /** 读 Windows 的"应用深色模式"开关；读不到返回 null（调用方决定兜底）。 */
+    private static Boolean windowsAppsUseDarkTheme() {
+        Process process = null;
         try {
-            String os = System.getProperty("os.name", "").toLowerCase();
-            if (os.contains("win")) {
-                Process p = new ProcessBuilder("reg", "query",
-                        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                        "/v", "AppsUseLightTheme").redirectErrorStream(true).start();
-                try (java.io.BufferedReader r = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(p.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = r.readLine()) != null) {
-                        if (line.contains("AppsUseLightTheme")) {
-                            return !line.trim().endsWith("0x1");
-                        }
-                    }
+            process = new ProcessBuilder("reg", "query",
+                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                    "/v", "AppsUseLightTheme").redirectErrorStream(true).start();
+            // reg.exe 正常几十毫秒返回；卡住就杀掉，绝不让 EDT 挂在这上面
+            if (!process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return null;
+            }
+            StringBuilder output = new StringBuilder();
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(process.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append('\n');
                 }
             }
-        } catch (Exception ignore) {
-            // 读不到就用默认
+            java.util.regex.Matcher matcher = java.util.regex.Pattern
+                    .compile("AppsUseLightTheme\\s+REG_DWORD\\s+0x([0-9a-fA-F]+)")
+                    .matcher(output);
+            if (!matcher.find()) {
+                return null;
+            }
+            return Integer.parseInt(matcher.group(1), 16) == 0;
+        } catch (Exception unavailable) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            return null;
         }
-        return true;
+    }
+
+    /**
+     * 跟随系统：每 3 秒复查一次系统亮暗（非 system 模式直接跳过）。
+     *
+     * 探测本身要起一次 reg.exe（几十毫秒），所以放在后台线程；只有"真的变了"才回 EDT 播过渡。
+     * 这样系统切深色时客户端会自己跟着变，不用重启 —— 3.2.4 之前这里完全没有复查。
+     */
+    private void startThemeWatch() {
+        if (themeWatch != null) {
+            return;
+        }
+        themeWatch = new javax.swing.Timer(3000, e -> {
+            if (!"system".equals(tm.mode()) || themeProbeRunning) {
+                return;
+            }
+            themeProbeRunning = true;
+            Thread probe = new Thread(() -> {
+                boolean systemIsDark = false;
+                try {
+                    systemIsDark = systemDark();
+                } catch (RuntimeException ignored) {
+                    // 探测失败就当没变化，下一轮再试
+                }
+                boolean dark = systemIsDark;
+                SwingUtilities.invokeLater(() -> {
+                    themeProbeRunning = false;
+                    if ("system".equals(tm.mode())) {
+                        tm.applySystemDark(dark);
+                    }
+                });
+            }, "dsh-theme-probe");
+            probe.setDaemon(true);
+            probe.start();
+        });
+        themeWatch.start();
+    }
+
+    /** 顶部按钮：跟随系统 → 亮色 → 暗色 → 跟随系统。 */
+    private void cycleThemeMode() {
+        String current = tm.mode();
+        String next;
+        if ("system".equals(current)) {
+            next = "light";
+        } else if ("light".equals(current)) {
+            next = "dark";
+        } else {
+            next = "system";
+        }
+        tm.setMode(next);
+        syncThemeControls();
+    }
+
+    /** 当前模式的中文名（按钮文字 + 设置下拉共用）。 */
+    private String themeLabel() {
+        return themeModeLabel(tm.mode());
+    }
+
+    private static String themeModeLabel(String mode) {
+        if ("light".equals(mode)) {
+            return "亮色";
+        }
+        if ("dark".equals(mode)) {
+            return "暗色";
+        }
+        return "跟随系统";
+    }
+
+    private static int themeModeIndex(String mode) {
+        for (int i = 0; i < THEME_MODES.length; i++) {
+            if (THEME_MODES[i].equals(mode)) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    /** 把当前模式同步到顶部按钮和设置下拉（不当作一次用户操作）。 */
+    private void syncThemeControls() {
+        ModernButton button = themeBtn;
+        if (button != null) {
+            String label = themeLabel();
+            if (!label.equals(button.getText())) {
+                button.setText(label);
+            }
+        }
+        dev.example.dshclient.ui.ChoiceField combo = themeCombo;
+        if (combo != null && combo.selectedIndex() != themeModeIndex(tm.mode())) {
+            syncingThemeCombo = true;
+            try {
+                combo.setSelectedIndex(themeModeIndex(tm.mode()));
+            } finally {
+                syncingThemeCombo = false;
+            }
+        }
     }
 
     /** 主题变了：从 ThemeManager 取当前令牌，刷整棵树 + 终端调色板。 */
@@ -846,7 +998,23 @@ final class ClientFrame extends JFrame {
         Font uiFont = UiFonts.ui(Font.PLAIN, UiFonts.BODY_SIZE);
         Font labelFont = UiFonts.ui(Font.PLAIN, UiFonts.LABEL_SIZE);
         applyFonts(getContentPane(), uiFont, labelFont);
+        syncThemeControls();
+        pushPageTheme();
         repaint();
+    }
+
+    /** 客户端定了亮暗就同步给内嵌 DSH 页面（CEF 的 prefers-color-scheme 不可靠时，页面也能对上）。 */
+    private void pushPageTheme() {
+        JcefView view = embedDsh;
+        if (view == null) {
+            return;
+        }
+        Boolean want = tm.isDarkEffective();
+        if (want.equals(pushedPageDark)) {
+            return;
+        }
+        pushedPageDark = want;
+        view.setPageDark(want);
     }
 
     /**
@@ -1992,6 +2160,8 @@ final class ClientFrame extends JFrame {
                         openInAppWindow(u, true);
                     });
                     embedDsh.setOnExternalLink(this::openInDefaultBrowser);
+                    embedDsh.setPageDark(tm.isDarkEffective());
+                    pushedPageDark = tm.isDarkEffective();
                     centerTabs.addTab("DSH 界面", embedDsh,
                             (anchor, x, y) -> showBrowserMenu(false, anchor, x, y));
                 }

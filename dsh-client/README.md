@@ -17,13 +17,15 @@
 - **内嵌终端**：自研字符矩阵 + ANSI SGR 解析，支持 CJK 宽字符、256 色、滚动回看、复制粘贴。
 - **内嵌浏览器**：JCEF；页面里的外链交给系统默认浏览器，DSH 自己的路由留在页签内。
 - **下载管理**：静默落盘 + 进度列表 + 断点续传 + 回收站删除；完成判定不依赖 CEF 回调，另有磁盘扫描兜底。
-- **主题**：暗 / 亮双主题，令牌驱动，自绘按钮、页签、弹层与设置面板。
+- **主题**：暗 / 亮 / **跟随系统**三态，令牌驱动，自绘按钮、页签、弹层与设置面板；
+  `跟随系统` 每 3 秒读一次 Windows 的应用深色模式（注册表 `AppsUseLightTheme`），系统切深色即时跟，不用重启；
+  右上角按钮三态循环，内嵌的 DSH 页面也会跟着一起换。
 
 ## 构建
 
 ```bash
-bash build-jar.sh 3.2.3        # 需要 JDK 17+ 与 jsch jar（自动在 ~/.gradle 里找）
-bash package.sh 3.2.3          # 产出 DshClient-<ver>-clean.zip
+bash build-jar.sh 3.2.4        # 需要 JDK 17+ 与 jsch jar（自动在 ~/.gradle 里找）
+bash package.sh 3.2.4          # 产出 DshClient-<ver>-clean.zip
 ```
 
 Windows 端：解压后双击 `run-cef.bat`（用 javaw 后台启动，不留 cmd 窗口）。

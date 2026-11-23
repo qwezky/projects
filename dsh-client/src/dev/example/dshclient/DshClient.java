@@ -46,7 +46,7 @@ public final class DshClient {
     static final String DEFAULT_TOKEN = "";
     /** 网页隧道（web 模式）的地址 */
     /** 版本号 —— **由 build-jar.sh 按参数自动写入**（别手改，改了就两边不一致）。 */
-    static final String VERSION = "3.2.3";
+    static final String VERSION = "3.2.4";
 
     static final String DEFAULT_WEB_URL = "https://dsh.example.com/";
     /**

@@ -239,6 +239,15 @@ final class JcefView extends JPanel {
                 }
             });
             CefBrowser br = client.createBrowser(pendingUrl, false, false);
+            // 3.2.4：页面加载完把客户端的亮暗推给它（见 setPageDark）
+            client.addLoadHandler(new org.cef.handler.CefLoadHandlerAdapter() {
+                @Override
+                public void onLoadEnd(CefBrowser loaded, org.cef.browser.CefFrame frame, int httpStatusCode) {
+                    if (frame == null || frame.isMain()) {
+                        pushPageDark(loaded);
+                    }
+                }
+            });
             this.browser = br;
             this.client = client;
             Component ui = br.getUIComponent();
@@ -364,6 +373,49 @@ final class JcefView extends JPanel {
             }
         } catch (Exception ignore) {
             // 浏览器已释放时忽略
+        }
+    }
+
+    /**
+     * 客户端当前生效的亮暗（true = 深色）；null = 还没定。
+     * 3.2.4：内嵌的 DSH 页面只信 Chromium 的 prefers-color-scheme，而 CEF 不是每台机器都跟随系统深色，
+     * 于是会出现"客户端已经是深色、网页还是浅色"。这里改由客户端拍板。
+     */
+    private volatile Boolean pageDark;
+
+    /**
+     * 把客户端判定的亮暗推给内嵌页。
+     *
+     * 只在页面自身处于「跟随系统」（{@code html[data-ds-theme-source]=system}）时覆盖；
+     * 用户若在 DSH 自己的设置里显式选了亮/暗，就尊重页面，不动它。
+     *
+     * @param dark 客户端当前是否深色
+     */
+    void setPageDark(boolean dark) {
+        pageDark = dark;
+        CefBrowser current = browser;
+        if (current != null) {
+            pushPageDark(current);
+        }
+    }
+
+    /** 执行那一小段对齐脚本；失败只是静默重试（下一次 loadEnd / 主题变化还会推）。 */
+    private void pushPageDark(CefBrowser target) {
+        Boolean want = pageDark;
+        if (want == null) {
+            return;
+        }
+        String js = "(function(){var want=" + (want.booleanValue() ? "true" : "false") + ";"
+                + "function apply(){var h=document.documentElement,b=document.body;if(!b)return;"
+                + "if(h.getAttribute('data-ds-theme-source')!=='system')return;"
+                + "var d=b.hasAttribute('data-ds-dark-theme');if(d===want)return;"
+                + "h.style.colorScheme=want?'dark':'light';"
+                + "if(want){b.setAttribute('data-ds-dark-theme','');}else{b.removeAttribute('data-ds-dark-theme');}}"
+                + "apply();if(!window.__dshClientThemeTimer){window.__dshClientThemeTimer=setInterval(apply,1500);}})();";
+        try {
+            target.getMainFrame().executeJavaScript(js, "", 0);
+        } catch (RuntimeException ignored) {
+            // 页面还没起来 / 正在导航
         }
     }
 

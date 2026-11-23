@@ -38,7 +38,6 @@ if [ -z "$EXTRA_CP" ]; then
   echo "  只想编译无内嵌版：先删掉 JcefView.java / JcefGate.java 并移除 ClientFrame 里的相关引用。" >&2
   exit 3
 fi
-done
 echo "==> 编译（目标 Java 17）${EXTRA_CP:+（含 cef 依赖）}"
 rm -rf build dist
 mkdir -p build/classes build/stage dist
